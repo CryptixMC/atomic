@@ -274,6 +274,7 @@ impl_reborrow_struct!(
     WikiArticle,
     WikiProposal,
     crate::briefing::Briefing,
+    crate::models::KindFilter,
 );
 
 /// Macro to generate async dispatch methods. For each method:
@@ -331,13 +332,13 @@ dispatch! {
         => sqlite: update_atom_content_only_impl, pg_trait: AtomStore, pg_method: update_atom_content_only;
     fn delete_atom_impl(&self, id: &str) -> Result<(), AtomicCoreError>
         => sqlite: delete_atom_impl, pg_trait: AtomStore, pg_method: delete_atom;
-    fn get_atoms_by_tag_impl(&self, tag_id: &str) -> Result<Vec<AtomWithTags>, AtomicCoreError>
+    fn get_atoms_by_tag_impl(&self, tag_id: &str, kinds: &crate::models::KindFilter) -> Result<Vec<AtomWithTags>, AtomicCoreError>
         => sqlite: get_atoms_by_tag_impl, pg_trait: AtomStore, pg_method: get_atoms_by_tag;
     fn get_atom_links_impl(&self, atom_id: &str) -> Result<Vec<AtomLink>, AtomicCoreError>
         => sqlite: get_atom_links_impl, pg_trait: AtomStore, pg_method: get_atom_links;
     fn suggest_atom_links_impl(&self, query: &str, limit: i32) -> Result<Vec<AtomLinkSuggestion>, AtomicCoreError>
         => sqlite: suggest_atom_links_impl, pg_trait: AtomStore, pg_method: suggest_atom_links;
-    fn list_atoms_impl(&self, params: &ListAtomsParams) -> Result<PaginatedAtoms, AtomicCoreError>
+    fn list_atoms_impl(&self, params: &ListAtomsParams, kinds: &crate::models::KindFilter) -> Result<PaginatedAtoms, AtomicCoreError>
         => sqlite: list_atoms_impl, pg_trait: AtomStore, pg_method: list_atoms;
     fn get_source_list_impl(&self) -> Result<Vec<SourceInfo>, AtomicCoreError>
         => sqlite: get_source_list_impl, pg_trait: AtomStore, pg_method: get_source_list;
@@ -349,7 +350,7 @@ dispatch! {
         => sqlite: get_atom_positions_impl, pg_trait: AtomStore, pg_method: get_atom_positions;
     fn save_atom_positions_impl(&self, positions: &[AtomPosition]) -> Result<(), AtomicCoreError>
         => sqlite: save_atom_positions_impl, pg_trait: AtomStore, pg_method: save_atom_positions;
-    fn get_atoms_with_embeddings_impl(&self) -> Result<Vec<AtomWithEmbedding>, AtomicCoreError>
+    fn get_atoms_with_embeddings_impl(&self, kinds: &crate::models::KindFilter) -> Result<Vec<AtomWithEmbedding>, AtomicCoreError>
         => sqlite: get_atoms_with_embeddings_impl, pg_trait: AtomStore, pg_method: get_atoms_with_embeddings;
     fn get_tag_ids_for_atoms_batch_impl(&self, atom_ids: &[String]) -> Result<Vec<String>, AtomicCoreError>
         => sqlite: get_tag_ids_for_atoms_batch_impl, pg_trait: AtomStore, pg_method: get_tag_ids_for_atoms_batch;
@@ -367,7 +368,7 @@ dispatch! {
         => sqlite: get_all_embedding_pairs_sync, pg_trait: AtomStore, pg_method: get_all_embedding_pairs;
     fn get_all_atom_tag_ids_sync(&self) -> Result<std::collections::HashMap<String, Vec<String>>, AtomicCoreError>
         => sqlite: get_all_atom_tag_ids_sync, pg_trait: AtomStore, pg_method: get_all_atom_tag_ids;
-    fn get_canvas_atom_metadata_light_sync(&self) -> Result<Vec<(String, String, Option<String>, i32, Option<String>)>, AtomicCoreError>
+    fn get_canvas_atom_metadata_light_sync(&self, kinds: &crate::models::KindFilter) -> Result<Vec<(String, String, Option<String>, i32, Option<String>)>, AtomicCoreError>
         => sqlite: get_canvas_atom_metadata_light_sync, pg_trait: AtomStore, pg_method: get_canvas_atom_metadata_light;
 
     // ---- TagStore ----
@@ -405,7 +406,7 @@ dispatch! {
         => sqlite: compute_tag_centroids_batch_impl, pg_trait: TagStore, pg_method: compute_tag_centroids_batch;
     fn get_tag_hierarchy_impl(&self, tag_id: &str) -> Result<Vec<String>, AtomicCoreError>
         => sqlite: get_tag_hierarchy_impl, pg_trait: TagStore, pg_method: get_tag_hierarchy;
-    fn count_atoms_with_tags_impl(&self, tag_ids: &[String]) -> Result<i32, AtomicCoreError>
+    fn count_atoms_with_tags_impl(&self, tag_ids: &[String], kinds: &crate::models::KindFilter) -> Result<i32, AtomicCoreError>
         => sqlite: count_atoms_with_tags_impl, pg_trait: TagStore, pg_method: count_atoms_with_tags;
 
     // ---- ChunkStore ----
@@ -485,9 +486,9 @@ dispatch! {
         => sqlite: keyword_search_sync, pg_trait: SearchStore, pg_method: keyword_search;
     fn find_similar_sync(&self, atom_id: &str, limit: i32, threshold: f32) -> Result<Vec<SimilarAtomResult>, AtomicCoreError>
         => sqlite: find_similar_sync, pg_trait: SearchStore, pg_method: find_similar;
-    fn keyword_search_chunks_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
+    fn keyword_search_chunks_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_chunks_sync, pg_trait: SearchStore, pg_method: keyword_search_chunks;
-    fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
+    fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: vector_search_chunks_sync, pg_trait: SearchStore, pg_method: vector_search_chunks;
 
     // ---- ChatStore ----
@@ -551,7 +552,7 @@ dispatch! {
         => sqlite: advance_wiki_baseline_sync, pg_trait: WikiStore, pg_method: advance_wiki_baseline;
 
     // ---- BriefingStore ----
-    fn list_new_atoms_since_sync(&self, since: &str, limit: i32) -> Result<Vec<AtomWithTags>, AtomicCoreError>
+    fn list_new_atoms_since_sync(&self, since: &str, limit: i32, kinds: &crate::models::KindFilter) -> Result<Vec<AtomWithTags>, AtomicCoreError>
         => sqlite: list_new_atoms_since_sync, pg_trait: BriefingStore, pg_method: list_new_atoms_since;
     fn count_new_atoms_since_sync(&self, since: &str) -> Result<i32, AtomicCoreError>
         => sqlite: count_new_atoms_since_sync, pg_trait: BriefingStore, pg_method: count_new_atoms_since;

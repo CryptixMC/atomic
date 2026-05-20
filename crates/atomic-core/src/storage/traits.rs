@@ -79,7 +79,13 @@ pub trait AtomStore: Send + Sync {
     async fn delete_atom(&self, id: &str) -> StorageResult<()>;
 
     /// Get all atoms with a specific tag (including descendants of that tag).
-    async fn get_atoms_by_tag(&self, tag_id: &str) -> StorageResult<Vec<AtomWithTags>>;
+    /// `kinds` restricts which atom kinds are included — see
+    /// [`crate::models::KindFilter`].
+    async fn get_atoms_by_tag(
+        &self,
+        tag_id: &str,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithTags>>;
 
     /// Get materialized markdown wiki-links emitted by a source atom.
     async fn get_atom_links(&self, atom_id: &str) -> StorageResult<Vec<AtomLink>>;
@@ -91,8 +97,13 @@ pub trait AtomStore: Send + Sync {
         limit: i32,
     ) -> StorageResult<Vec<AtomLinkSuggestion>>;
 
-    /// List atoms with pagination, filtering, and sorting.
-    async fn list_atoms(&self, params: &ListAtomsParams) -> StorageResult<PaginatedAtoms>;
+    /// List atoms with pagination, filtering, and sorting. `kinds` restricts
+    /// which atom kinds appear in the results and the total count.
+    async fn list_atoms(
+        &self,
+        params: &ListAtomsParams,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<PaginatedAtoms>;
 
     /// Get all unique sources with atom counts.
     async fn get_source_list(&self) -> StorageResult<Vec<SourceInfo>>;
@@ -109,8 +120,12 @@ pub trait AtomStore: Send + Sync {
     /// Save atom canvas positions (replaces all).
     async fn save_atom_positions(&self, positions: &[AtomPosition]) -> StorageResult<()>;
 
-    /// Get all atoms with their average embedding vectors.
-    async fn get_atoms_with_embeddings(&self) -> StorageResult<Vec<AtomWithEmbedding>>;
+    /// Get all atoms with their average embedding vectors. `kinds` restricts
+    /// which atom kinds are included.
+    async fn get_atoms_with_embeddings(
+        &self,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithEmbedding>>;
 
     /// Get just the tag IDs for an atom (lightweight, no full atom fetch).
     async fn get_atom_tag_ids(&self, atom_id: &str) -> StorageResult<Vec<String>>;
@@ -171,6 +186,7 @@ pub trait AtomStore: Send + Sync {
     /// Lightweight canvas metadata: (atom_id, title, primary_tag_name, tag_count, source_url).
     async fn get_canvas_atom_metadata_light(
         &self,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<(String, String, Option<String>, i32, Option<String>)>>;
 }
 
@@ -252,7 +268,11 @@ pub trait TagStore: Send + Sync {
     async fn get_tag_hierarchy(&self, tag_id: &str) -> StorageResult<Vec<String>>;
 
     /// Count distinct atoms that have any of the given tags.
-    async fn count_atoms_with_tags(&self, tag_ids: &[String]) -> StorageResult<i32>;
+    async fn count_atoms_with_tags(
+        &self,
+        tag_ids: &[String],
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32>;
 }
 
 // ==================== Chunk/Embedding Storage ====================
@@ -543,6 +563,7 @@ pub trait SearchStore: Send + Sync {
         limit: i32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
 
     /// Search for chunks using vector similarity.
@@ -554,6 +575,7 @@ pub trait SearchStore: Send + Sync {
         threshold: f32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
 }
 
@@ -746,6 +768,7 @@ pub trait BriefingStore: Send + Sync {
         &self,
         since: &str,
         limit: i32,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<AtomWithTags>>;
 
     /// Count atoms with `created_at > since`.

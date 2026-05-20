@@ -20,22 +20,38 @@ impl SqliteStorage {
         &self,
         since: &str,
         limit: i32,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<AtomWithTags>> {
         use crate::models::{Atom, Tag};
         let conn = self.db.read_conn()?;
 
-        let mut stmt = conn.prepare(
+        // All positional `?` placeholders so the kind binds slot cleanly
+        // between `since` and `limit` without disturbing numbered semantics.
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("kind");
+        let sql = format!(
             "SELECT id, content, title, snippet, source_url, source, published_at,
                     created_at, updated_at, embedding_status, tagging_status,
-                    embedding_error, tagging_error
+                    embedding_error, tagging_error, COALESCE(kind, 'captured')
              FROM atoms
-             WHERE created_at > ?1
+             WHERE created_at > ?
+               AND {kind_frag}
              ORDER BY created_at DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+
+        let mut bind_refs: Vec<&dyn rusqlite::ToSql> = vec![&since];
+        for v in &kind_binds {
+            bind_refs.push(v as &dyn rusqlite::ToSql);
+        }
+        bind_refs.push(&limit);
 
         let atoms: Vec<Atom> = stmt
-            .query_map(rusqlite::params![since, limit], |row| {
+            .query_map(rusqlite::params_from_iter(bind_refs.iter()), |row| {
+                let kind_str: String = row.get(13)?;
+                let kind = kind_str
+                    .parse::<crate::models::AtomKind>()
+                    .unwrap_or(crate::models::AtomKind::Captured);
                 Ok(Atom {
                     id: row.get(0)?,
                     content: row.get(1)?,
@@ -50,6 +66,7 @@ impl SqliteStorage {
                     tagging_status: row.get(10)?,
                     embedding_error: row.get(11)?,
                     tagging_error: row.get(12)?,
+                    kind,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -279,12 +296,16 @@ impl BriefingStore for SqliteStorage {
         &self,
         since: &str,
         limit: i32,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<AtomWithTags>> {
         let storage = self.clone();
         let since = since.to_string();
-        tokio::task::spawn_blocking(move || storage.list_new_atoms_since_sync(&since, limit))
-            .await
-            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+        let kinds = kinds.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.list_new_atoms_since_sync(&since, limit, &kinds)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 
     async fn count_new_atoms_since(&self, since: &str) -> StorageResult<i32> {

@@ -130,12 +130,18 @@ async fn test_tag_hierarchy_and_atom_association() {
     assert_eq!(atom.tags[0].name, "Physics");
 
     // get_atoms_by_tag on parent should include child's atoms
-    let by_parent = core.get_atoms_by_tag(&parent.id).await.unwrap();
+    let by_parent = core
+        .get_atoms_by_tag(&parent.id, &atomic_core::models::KindFilter::All)
+        .await
+        .unwrap();
     assert_eq!(by_parent.len(), 1);
     assert_eq!(by_parent[0].atom.id, atom.atom.id);
 
     // get_atoms_by_tag on child directly
-    let by_child = core.get_atoms_by_tag(&child.id).await.unwrap();
+    let by_child = core
+        .get_atoms_by_tag(&child.id, &atomic_core::models::KindFilter::All)
+        .await
+        .unwrap();
     assert_eq!(by_child.len(), 1);
 
     // Update tag name
@@ -165,17 +171,20 @@ async fn test_list_atoms_offset_and_cursor_pagination() {
 
     // Offset pagination: page 1
     let page1 = core
-        .list_atoms(&ListAtomsParams {
-            tag_id: None,
-            limit: 3,
-            offset: 0,
-            cursor: None,
-            cursor_id: None,
-            source_filter: SourceFilter::All,
-            source_value: None,
-            sort_by: SortField::Updated,
-            sort_order: SortOrder::Desc,
-        })
+        .list_atoms(
+            &ListAtomsParams {
+                tag_id: None,
+                limit: 3,
+                offset: 0,
+                cursor: None,
+                cursor_id: None,
+                source_filter: SourceFilter::All,
+                source_value: None,
+                sort_by: SortField::Updated,
+                sort_order: SortOrder::Desc,
+            },
+            &atomic_core::models::KindFilter::All,
+        )
         .await
         .unwrap();
     assert_eq!(page1.atoms.len(), 3);
@@ -185,17 +194,20 @@ async fn test_list_atoms_offset_and_cursor_pagination() {
 
     // Cursor pagination: page 2 using cursor from page 1
     let page2 = core
-        .list_atoms(&ListAtomsParams {
-            tag_id: None,
-            limit: 3,
-            offset: 0,
-            cursor: page1.next_cursor,
-            cursor_id: page1.next_cursor_id,
-            source_filter: SourceFilter::All,
-            source_value: None,
-            sort_by: SortField::Updated,
-            sort_order: SortOrder::Desc,
-        })
+        .list_atoms(
+            &ListAtomsParams {
+                tag_id: None,
+                limit: 3,
+                offset: 0,
+                cursor: page1.next_cursor,
+                cursor_id: page1.next_cursor_id,
+                source_filter: SourceFilter::All,
+                source_value: None,
+                sort_by: SortField::Updated,
+                sort_order: SortOrder::Desc,
+            },
+            &atomic_core::models::KindFilter::All,
+        )
         .await
         .unwrap();
     assert_eq!(page2.atoms.len(), 3);
@@ -217,17 +229,20 @@ async fn test_list_atoms_sort_fields() {
 
     // Sort by title ascending
     let result = core
-        .list_atoms(&ListAtomsParams {
-            tag_id: None,
-            limit: 10,
-            offset: 0,
-            cursor: None,
-            cursor_id: None,
-            source_filter: SourceFilter::All,
-            source_value: None,
-            sort_by: SortField::Title,
-            sort_order: SortOrder::Asc,
-        })
+        .list_atoms(
+            &ListAtomsParams {
+                tag_id: None,
+                limit: 10,
+                offset: 0,
+                cursor: None,
+                cursor_id: None,
+                source_filter: SourceFilter::All,
+                source_value: None,
+                sort_by: SortField::Title,
+                sort_order: SortOrder::Asc,
+            },
+            &atomic_core::models::KindFilter::All,
+        )
         .await
         .unwrap();
 
@@ -318,34 +333,40 @@ async fn test_source_url_tracking() {
 
     // Filter to external only
     let external = core
-        .list_atoms(&ListAtomsParams {
-            tag_id: None,
-            limit: 10,
-            offset: 0,
-            cursor: None,
-            cursor_id: None,
-            source_filter: SourceFilter::External,
-            source_value: None,
-            sort_by: SortField::Updated,
-            sort_order: SortOrder::Desc,
-        })
+        .list_atoms(
+            &ListAtomsParams {
+                tag_id: None,
+                limit: 10,
+                offset: 0,
+                cursor: None,
+                cursor_id: None,
+                source_filter: SourceFilter::External,
+                source_value: None,
+                sort_by: SortField::Updated,
+                sort_order: SortOrder::Desc,
+            },
+            &atomic_core::models::KindFilter::All,
+        )
         .await
         .unwrap();
     assert_eq!(external.total_count, 1);
 
     // Filter to manual only
     let manual = core
-        .list_atoms(&ListAtomsParams {
-            tag_id: None,
-            limit: 10,
-            offset: 0,
-            cursor: None,
-            cursor_id: None,
-            source_filter: SourceFilter::Manual,
-            source_value: None,
-            sort_by: SortField::Updated,
-            sort_order: SortOrder::Desc,
-        })
+        .list_atoms(
+            &ListAtomsParams {
+                tag_id: None,
+                limit: 10,
+                offset: 0,
+                cursor: None,
+                cursor_id: None,
+                source_filter: SourceFilter::Manual,
+                source_value: None,
+                sort_by: SortField::Updated,
+                sort_order: SortOrder::Desc,
+            },
+            &atomic_core::models::KindFilter::All,
+        )
         .await
         .unwrap();
     assert_eq!(manual.total_count, 1);
@@ -403,17 +424,20 @@ async fn test_empty_database_queries() {
 
     assert!(core.get_all_atoms().await.unwrap().is_empty());
     let page = core
-        .list_atoms(&ListAtomsParams {
-            tag_id: None,
-            limit: 10,
-            offset: 0,
-            cursor: None,
-            cursor_id: None,
-            source_filter: SourceFilter::All,
-            source_value: None,
-            sort_by: SortField::Updated,
-            sort_order: SortOrder::Desc,
-        })
+        .list_atoms(
+            &ListAtomsParams {
+                tag_id: None,
+                limit: 10,
+                offset: 0,
+                cursor: None,
+                cursor_id: None,
+                source_filter: SourceFilter::All,
+                source_value: None,
+                sort_by: SortField::Updated,
+                sort_order: SortOrder::Desc,
+            },
+            &atomic_core::models::KindFilter::All,
+        )
         .await
         .unwrap();
     assert_eq!(page.total_count, 0);

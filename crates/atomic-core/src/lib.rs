@@ -1145,12 +1145,19 @@ impl AtomicCore {
         Ok(())
     }
 
-    /// Get atoms by tag (includes atoms with descendant tags)
+    /// Get atoms by tag (includes atoms with descendant tags).
+    ///
+    /// `kinds` is non-defaulted to force every caller to declare intent — see
+    /// [`crate::models::KindFilter`]. Display callers pass `KindFilter::All`;
+    /// synthesis / context-assembly callers (wiki gen, etc.) typically pass
+    /// `KindFilter::only(AtomKind::Captured)` to keep agent-emitted findings
+    /// out of the corpus.
     pub async fn get_atoms_by_tag(
         &self,
         tag_id: &str,
+        kinds: &crate::models::KindFilter,
     ) -> Result<Vec<AtomWithTags>, AtomicCoreError> {
-        self.storage.get_atoms_by_tag_impl(tag_id).await
+        self.storage.get_atoms_by_tag_impl(tag_id, kinds).await
     }
 
     /// Get materialized `[[...]]` links emitted by an atom.
@@ -1182,8 +1189,9 @@ impl AtomicCore {
     pub async fn list_atoms(
         &self,
         params: &ListAtomsParams,
+        kinds: &crate::models::KindFilter,
     ) -> Result<PaginatedAtoms, AtomicCoreError> {
-        self.storage.list_atoms_impl(params).await
+        self.storage.list_atoms_impl(params, kinds).await
     }
 
     /// Get a list of distinct source values with counts (for filter dropdowns).
@@ -2435,8 +2443,9 @@ impl AtomicCore {
     /// Get atoms with their average embedding vector for similarity calculations
     pub async fn get_atoms_with_embeddings(
         &self,
+        kinds: &crate::models::KindFilter,
     ) -> Result<Vec<AtomWithEmbedding>, AtomicCoreError> {
-        self.storage.get_atoms_with_embeddings_impl().await
+        self.storage.get_atoms_with_embeddings_impl(kinds).await
     }
 
     /// Return a handle to the canvas cache so background tasks (e.g. embedding
@@ -2532,8 +2541,12 @@ impl AtomicCore {
             .collect();
 
         // Load lightweight canvas metadata (id, title, first tag, tag count, tag_ids)
-        // — no full content, no embedding blobs, single query with LEFT JOIN
-        let atom_metadata = storage.get_canvas_atom_metadata_light_sync().await?;
+        // — no full content, no embedding blobs, single query with LEFT JOIN.
+        // Canvas is a display surface; show every kind, including findings
+        // once reports exist, so the user can see their full knowledge graph.
+        let atom_metadata = storage
+            .get_canvas_atom_metadata_light_sync(&crate::models::KindFilter::All)
+            .await?;
         let mut atom_tag_map = storage.get_all_atom_tag_ids_sync().await?;
 
         let atoms: Vec<CanvasAtomPosition> = atom_metadata
@@ -4245,13 +4258,17 @@ pub(crate) fn parse_source(source_url: &str) -> String {
 }
 
 /// Standard SELECT columns for reading an Atom from the DB.
-pub(crate) const ATOM_COLUMNS: &str = "id, content, title, snippet, source_url, source, published_at, created_at, updated_at, COALESCE(embedding_status, 'pending'), COALESCE(tagging_status, 'pending'), embedding_error, tagging_error";
+pub(crate) const ATOM_COLUMNS: &str = "id, content, title, snippet, source_url, source, published_at, created_at, updated_at, COALESCE(embedding_status, 'pending'), COALESCE(tagging_status, 'pending'), embedding_error, tagging_error, COALESCE(kind, 'captured')";
 
 /// Same columns but table-aliased for JOINs.
-pub(crate) const ATOM_COLUMNS_A: &str = "a.id, a.content, a.title, a.snippet, a.source_url, a.source, a.published_at, a.created_at, a.updated_at, COALESCE(a.embedding_status, 'pending'), COALESCE(a.tagging_status, 'pending'), a.embedding_error, a.tagging_error";
+pub(crate) const ATOM_COLUMNS_A: &str = "a.id, a.content, a.title, a.snippet, a.source_url, a.source, a.published_at, a.created_at, a.updated_at, COALESCE(a.embedding_status, 'pending'), COALESCE(a.tagging_status, 'pending'), a.embedding_error, a.tagging_error, COALESCE(a.kind, 'captured')";
 
 /// Parse an Atom from a row selected with ATOM_COLUMNS.
 pub(crate) fn atom_from_row(row: &rusqlite::Row) -> rusqlite::Result<Atom> {
+    let kind_str: String = row.get(13)?;
+    let kind = kind_str
+        .parse::<crate::models::AtomKind>()
+        .unwrap_or(crate::models::AtomKind::Captured);
     Ok(Atom {
         id: row.get(0)?,
         content: row.get(1)?,
@@ -4266,6 +4283,7 @@ pub(crate) fn atom_from_row(row: &rusqlite::Row) -> rusqlite::Result<Atom> {
         tagging_status: row.get(10)?,
         embedding_error: row.get(11)?,
         tagging_error: row.get(12)?,
+        kind,
     })
 }
 
@@ -5385,7 +5403,10 @@ mod tests {
             .unwrap();
 
         // Query by parent tag (Topics) should include atoms tagged with AI
-        let atoms = db.get_atoms_by_tag(&topics.id).await.unwrap();
+        let atoms = db
+            .get_atoms_by_tag(&topics.id, &crate::models::KindFilter::All)
+            .await
+            .unwrap();
 
         assert_eq!(atoms.len(), 1);
         assert_eq!(atoms[0].atom.id, atom.atom.id);
@@ -5464,5 +5485,394 @@ mod tests {
             strip_inline_markdown(r"The **U\.S\.** has [a link](http://x.com)"),
             "The U.S. has a link"
         );
+    }
+
+    // ==================== Atom-kind discriminator (V18) ====================
+    //
+    // Tests live inline so they can use the unexposed test-only helper
+    // `stamp_report_kind` to simulate a `kind = 'report'` atom — phase 2's
+    // report writer will be the production path that emits these.
+
+    /// Test-only: flip an atom's kind to 'report' via raw SQL. Phase 1 has no
+    /// production write path that produces report atoms; this helper exists
+    /// only to verify the filter discipline holds *once* such atoms exist.
+    fn stamp_report_kind(db: &AtomicCore, atom_id: &str) {
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE atoms SET kind = 'report' WHERE id = ?1",
+            rusqlite::params![atom_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_migration_defaults_existing_atoms_to_captured() {
+        let (db, _temp) = create_empty_test_db();
+        let atom = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Captured note".to_string(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Newly inserted atom carries the default kind...
+        assert_eq!(atom.atom.kind, models::AtomKind::Captured);
+        // ...and round-trips back from the DB.
+        let read_back = db.get_atom(&atom.atom.id).await.unwrap().unwrap();
+        assert_eq!(read_back.atom.kind, models::AtomKind::Captured);
+    }
+
+    #[tokio::test]
+    async fn test_get_atoms_by_tag_filters_by_kind() {
+        let (db, _temp) = create_test_db().await;
+        let topics = get_seeded_tag(&db, "Topics");
+        let tag = db.create_tag("AI", Some(&topics.id)).await.unwrap();
+
+        let captured = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Captured atom".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let report = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Future finding".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        stamp_report_kind(&db, &report.atom.id);
+
+        // All: both kinds returned
+        let all = db
+            .get_atoms_by_tag(&tag.id, &models::KindFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Only(Captured): report excluded
+        let captured_only = db
+            .get_atoms_by_tag(
+                &tag.id,
+                &models::KindFilter::only(models::AtomKind::Captured),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured_only.len(), 1);
+        assert_eq!(captured_only[0].atom.id, captured.atom.id);
+        assert_eq!(captured_only[0].atom.kind, models::AtomKind::Captured);
+
+        // Only(Report): only report returned
+        let report_only = db
+            .get_atoms_by_tag(&tag.id, &models::KindFilter::only(models::AtomKind::Report))
+            .await
+            .unwrap();
+        assert_eq!(report_only.len(), 1);
+        assert_eq!(report_only[0].atom.id, report.atom.id);
+        assert_eq!(report_only[0].atom.kind, models::AtomKind::Report);
+    }
+
+    #[tokio::test]
+    async fn test_list_atoms_filters_by_kind() {
+        let (db, _temp) = create_empty_test_db();
+        let captured = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Captured".to_string(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let report = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Report".to_string(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        stamp_report_kind(&db, &report.atom.id);
+
+        let params = ListAtomsParams {
+            tag_id: None,
+            limit: 50,
+            offset: 0,
+            cursor: None,
+            cursor_id: None,
+            source_filter: SourceFilter::All,
+            source_value: None,
+            sort_by: SortField::Updated,
+            sort_order: SortOrder::Desc,
+        };
+
+        let all = db
+            .list_atoms(&params, &models::KindFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(all.atoms.len(), 2);
+        assert_eq!(all.total_count, 2);
+
+        let captured_only = db
+            .list_atoms(
+                &params,
+                &models::KindFilter::only(models::AtomKind::Captured),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured_only.atoms.len(), 1);
+        assert_eq!(captured_only.atoms[0].id, captured.atom.id);
+        // The denormalized fast-path is kind-blind — filtering forces the
+        // slow path. Confirm total_count reflects the filter too.
+        assert_eq!(captured_only.total_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_count_atoms_with_tags_filters_by_kind() {
+        let (db, _temp) = create_test_db().await;
+        let topics = get_seeded_tag(&db, "Topics");
+        let tag = db.create_tag("AI", Some(&topics.id)).await.unwrap();
+
+        db.create_atom(
+            CreateAtomRequest {
+                content: "# Captured".to_string(),
+                tag_ids: vec![tag.id.clone()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let report = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Report".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        stamp_report_kind(&db, &report.atom.id);
+
+        let storage = &db.storage;
+        let all = storage
+            .count_atoms_with_tags_impl(&[tag.id.clone()], &models::KindFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(all, 2);
+
+        let captured_only = storage
+            .count_atoms_with_tags_impl(
+                &[tag.id.clone()],
+                &models::KindFilter::only(models::AtomKind::Captured),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured_only, 1);
+    }
+
+    #[tokio::test]
+    async fn test_kind_filter_empty_only_matches_nothing() {
+        // The `Only(vec![])` defensive case: must match nothing, not silently
+        // degrade to "no filter."
+        let (db, _temp) = create_empty_test_db();
+        db.create_atom(
+            CreateAtomRequest {
+                content: "# One".to_string(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let params = ListAtomsParams {
+            tag_id: None,
+            limit: 50,
+            offset: 0,
+            cursor: None,
+            cursor_id: None,
+            source_filter: SourceFilter::All,
+            source_value: None,
+            sort_by: SortField::Updated,
+            sort_order: SortOrder::Desc,
+        };
+        let result = db
+            .list_atoms(&params, &models::KindFilter::Only(vec![]))
+            .await
+            .unwrap();
+        assert_eq!(result.atoms.len(), 0);
+        assert_eq!(result.total_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_atom_kind_roundtrips_through_create_path() {
+        // CreateAtomRequest does not accept `kind` — every user-facing create
+        // path produces a Captured atom. This test pins that invariant.
+        let (db, _temp) = create_empty_test_db();
+        let atom = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "test".to_string(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(atom.atom.kind, models::AtomKind::Captured);
+    }
+
+    /// Test-only: insert a chunk row for an atom (bypasses the embedding
+    /// pipeline). Used by the wiki source-chunk filter test to give both the
+    /// captured and report atoms something the wiki query would otherwise
+    /// happily pull.
+    fn insert_test_chunk(db: &AtomicCore, atom_id: &str, chunk_index: i32, content: &str) {
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO atom_chunks (id, atom_id, chunk_index, content) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, atom_id, chunk_index, content],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wiki_source_chunks_excludes_report_atoms() {
+        // Centroid + unranked chunk selection MUST filter by kind at scope
+        // resolution. Filtering only the atom_count (the bug) would leave
+        // report-kind chunks in the LLM's source material while the count
+        // claimed they weren't there.
+        let (db, _temp) = create_test_db().await;
+        let topics = get_seeded_tag(&db, "Topics");
+        let tag = db.create_tag("AI", Some(&topics.id)).await.unwrap();
+
+        let captured = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "captured content".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let report = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "report finding content".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        stamp_report_kind(&db, &report.atom.id);
+
+        // Chunks for both atoms; the report atom's chunk is the contamination
+        // signal — it must NOT appear in wiki source results.
+        insert_test_chunk(&db, &captured.atom.id, 0, "captured chunk");
+        insert_test_chunk(&db, &report.atom.id, 0, "report chunk should not leak");
+
+        // No tag centroid in test DB → exercises the unranked fallback path,
+        // which is where the previous bug lived (its SQL re-joined atom_tags
+        // and never saw atoms.kind).
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let (chunks, atom_count) = sqlite
+            .get_wiki_source_chunks_sync(&tag.id, 100_000)
+            .unwrap();
+
+        assert_eq!(atom_count, 1, "count should reflect captured-only scope");
+        let atom_ids: std::collections::HashSet<&str> =
+            chunks.iter().map(|c| c.atom_id.as_str()).collect();
+        assert!(
+            !atom_ids.contains(report.atom.id.as_str()),
+            "report-kind atom must not appear in wiki source chunks"
+        );
+        assert!(
+            atom_ids.contains(captured.atom.id.as_str()),
+            "captured atom should still be a wiki source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wiki_update_chunks_excludes_report_atoms() {
+        let (db, _temp) = create_test_db().await;
+        let topics = get_seeded_tag(&db, "Topics");
+        let tag = db.create_tag("AI", Some(&topics.id)).await.unwrap();
+
+        // Anchor "last_update" before creating any new atoms.
+        let last_update = "1970-01-01T00:00:00Z";
+
+        let captured = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "captured".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let report = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "report".to_string(),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        stamp_report_kind(&db, &report.atom.id);
+        insert_test_chunk(&db, &captured.atom.id, 0, "captured update chunk");
+        insert_test_chunk(&db, &report.atom.id, 0, "report update chunk leak");
+
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let result = sqlite
+            .get_wiki_update_chunks_sync(&tag.id, last_update, 100_000)
+            .unwrap();
+        let (chunks, atom_count) = result.expect("expected update chunks");
+        assert_eq!(atom_count, 1);
+        let atom_ids: std::collections::HashSet<&str> =
+            chunks.iter().map(|c| c.atom_id.as_str()).collect();
+        assert!(!atom_ids.contains(report.atom.id.as_str()));
+        assert!(atom_ids.contains(captured.atom.id.as_str()));
     }
 }

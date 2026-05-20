@@ -533,9 +533,14 @@ impl SqliteStorage {
         crate::wiki::get_tag_hierarchy(&conn, tag_id).map_err(|e| AtomicCoreError::Wiki(e))
     }
 
-    pub(crate) fn count_atoms_with_tags_impl(&self, tag_ids: &[String]) -> StorageResult<i32> {
+    pub(crate) fn count_atoms_with_tags_impl(
+        &self,
+        tag_ids: &[String],
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
         let conn = self.db.read_conn()?;
-        crate::wiki::count_atoms_with_tags(&conn, tag_ids).map_err(|e| AtomicCoreError::Wiki(e))
+        crate::wiki::count_atoms_with_tags(&conn, tag_ids, kinds)
+            .map_err(|e| AtomicCoreError::Wiki(e))
     }
 
     pub(crate) fn apply_tag_merges_impl(
@@ -654,7 +659,11 @@ impl TagStore for SqliteStorage {
         self.get_tag_hierarchy_impl(tag_id)
     }
 
-    async fn count_atoms_with_tags(&self, tag_ids: &[String]) -> StorageResult<i32> {
-        self.count_atoms_with_tags_impl(tag_ids)
+    async fn count_atoms_with_tags(
+        &self,
+        tag_ids: &[String],
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
+        self.count_atoms_with_tags_impl(tag_ids, kinds)
     }
 }

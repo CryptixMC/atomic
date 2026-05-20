@@ -151,9 +151,14 @@ async fn handle_search(
 
     tracing::debug!(query = %query, limit, "[wiki/agentic] search");
 
+    // Wiki synthesis is captured-content-only: agent-emitted findings
+    // (kind = 'report') must not become wiki source material, or the
+    // encyclopedia ends up citing its own research journal.
+    let kinds = crate::models::KindFilter::only(crate::models::AtomKind::Captured);
+
     // Perform hybrid search: keyword + vector, merged via RRF
     let keyword_results = match storage
-        .keyword_search_chunks_sync(&query, limit * 2, scope_tag_ids, None)
+        .keyword_search_chunks_sync(&query, limit * 2, scope_tag_ids, None, &kinds)
         .await
     {
         Ok(r) => r,
@@ -173,6 +178,7 @@ async fn handle_search(
                             0.3,
                             scope_tag_ids,
                             None,
+                            &kinds,
                         )
                         .await
                     {
@@ -497,7 +503,10 @@ pub(crate) async fn generate(
         .map_err(|e| e.to_string())?;
     let atom_count = ctx
         .storage
-        .count_atoms_with_tags_impl(&scope_tag_ids)
+        .count_atoms_with_tags_impl(
+            &scope_tag_ids,
+            &crate::models::KindFilter::only(crate::models::AtomKind::Captured),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -584,7 +593,10 @@ pub(crate) async fn research_for_update(
         .map_err(|e| e.to_string())?;
     let atom_count = ctx
         .storage
-        .count_atoms_with_tags_impl(&scope_tag_ids)
+        .count_atoms_with_tags_impl(
+            &scope_tag_ids,
+            &crate::models::KindFilter::only(crate::models::AtomKind::Captured),
+        )
         .await
         .map_err(|e| e.to_string())?;
 

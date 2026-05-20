@@ -19,8 +19,20 @@ impl BriefingStore for PostgresStorage {
         &self,
         since: &str,
         limit: i32,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<AtomWithTags>> {
-        let atoms: Vec<Atom> = sqlx::query_as::<
+        let kind_predicate = kinds.postgres_predicate("kind", "$4");
+        let sql = format!(
+            "SELECT id, content, title, snippet, source_url, source, published_at,
+                    created_at, updated_at, embedding_status, tagging_status,
+                    embedding_error, tagging_error,
+                    COALESCE(kind, 'captured')
+             FROM atoms
+             WHERE created_at > $1 AND db_id = $2 AND {kind_predicate}
+             ORDER BY created_at DESC
+             LIMIT $3"
+        );
+        let mut q = sqlx::query_as::<
             _,
             (
                 String,
@@ -36,55 +48,56 @@ impl BriefingStore for PostgresStorage {
                 String,
                 Option<String>,
                 Option<String>,
+                String,
             ),
-        >(
-            "SELECT id, content, title, snippet, source_url, source, published_at,
-                    created_at, updated_at, embedding_status, tagging_status,
-                    embedding_error, tagging_error
-             FROM atoms
-             WHERE created_at > $1 AND db_id = $2
-             ORDER BY created_at DESC
-             LIMIT $3",
-        )
+        >(&sql)
         .bind(since)
         .bind(&self.db_id)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
-        .into_iter()
-        .map(
-            |(
-                id,
-                content,
-                title,
-                snippet,
-                source_url,
-                source,
-                published_at,
-                created_at,
-                updated_at,
-                embedding_status,
-                tagging_status,
-                embedding_error,
-                tagging_error,
-            )| Atom {
-                id,
-                content,
-                title,
-                snippet,
-                source_url,
-                source,
-                published_at,
-                created_at,
-                updated_at,
-                embedding_status,
-                tagging_status,
-                embedding_error,
-                tagging_error,
-            },
-        )
-        .collect();
+        .bind(limit as i64);
+        if kinds.has_bind_value() {
+            q = q.bind(kinds.kind_strings());
+        }
+        let atoms: Vec<Atom> = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    content,
+                    title,
+                    snippet,
+                    source_url,
+                    source,
+                    published_at,
+                    created_at,
+                    updated_at,
+                    embedding_status,
+                    tagging_status,
+                    embedding_error,
+                    tagging_error,
+                    kind_str,
+                )| Atom {
+                    id,
+                    content,
+                    title,
+                    snippet,
+                    source_url,
+                    source,
+                    published_at,
+                    created_at,
+                    updated_at,
+                    embedding_status,
+                    tagging_status,
+                    embedding_error,
+                    tagging_error,
+                    kind: kind_str
+                        .parse::<crate::models::AtomKind>()
+                        .unwrap_or(crate::models::AtomKind::Captured),
+                },
+            )
+            .collect();
 
         if atoms.is_empty() {
             return Ok(Vec::new());

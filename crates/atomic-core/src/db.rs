@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 17;
+    const LATEST_VERSION: i32 = 18;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -856,6 +856,33 @@ impl Database {
                         )?;
                     }
                 }
+            }
+
+            conn.execute_batch("PRAGMA user_version = 17;")?;
+        }
+
+        // --- V17 → V18: Add `kind` discriminator to atoms ---
+        //
+        // Reports (a coming primitive — see docs/plans/reports.md) emit
+        // finding atoms that share the atoms table with user-captured notes.
+        // The `kind` column lets every context-assembly query exclude or
+        // include report-generated content explicitly. Existing rows default
+        // to 'captured', which is the only kind any production write path
+        // currently produces.
+        if version < 18 {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('atoms') WHERE name='kind'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE atoms ADD COLUMN kind TEXT NOT NULL DEFAULT 'captured';
+                     CREATE INDEX IF NOT EXISTS idx_atoms_kind ON atoms(kind);",
+                )?;
             }
 
             conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;

@@ -415,7 +415,10 @@ async fn test_list_atoms_pagination(storage: &dyn AtomStore) {
         sort_order: SortOrder::Desc,
     };
 
-    let page = storage.list_atoms(&params).await.unwrap();
+    let page = storage
+        .list_atoms(&params, &atomic_core::models::KindFilter::All)
+        .await
+        .unwrap();
     assert_eq!(page.atoms.len(), 2);
     assert!(page.total_count >= 5);
 }

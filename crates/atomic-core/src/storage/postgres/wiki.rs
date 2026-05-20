@@ -420,12 +420,20 @@ impl WikiStore for PostgresStorage {
             ));
         }
 
-        // Get scoped atom IDs
+        // Wiki context-assembly is captured-only — apply the kind filter at
+        // scope-resolution so the centroid / unranked chunk selectors below
+        // can never see report-kind atoms. Filtering only the final count
+        // (the previous shape) silently fed report chunks to the LLM.
+        let captured_kinds = crate::models::KindFilter::only(crate::models::AtomKind::Captured);
         let scoped_atom_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT atom_id FROM atom_tags WHERE tag_id = ANY($1) AND db_id = $2",
+            "SELECT DISTINCT at.atom_id
+             FROM atom_tags at
+             INNER JOIN atoms a ON a.id = at.atom_id AND a.db_id = at.db_id
+             WHERE at.tag_id = ANY($1) AND at.db_id = $2 AND a.kind = ANY($3)",
         )
         .bind(&all_tag_ids)
         .bind(&self.db_id)
+        .bind(captured_kinds.kind_strings())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AtomicCoreError::Wiki(e.to_string()))?;
@@ -481,19 +489,19 @@ impl WikiStore for PostgresStorage {
             }
             chunks
         } else {
-            // Fallback: fetch by insertion order
+            // Fallback: fetch by insertion order — scoped through
+            // `scoped_atom_ids` (kind-filtered above) instead of re-joining
+            // through atom_tags, so both paths see the same atom set.
             tracing::debug!(
                 tag_id,
                 "[wiki/postgres] No centroid for tag, falling back to unranked"
             );
             let rows: Vec<(String, i32, String)> = sqlx::query_as(
-                "SELECT DISTINCT ac.atom_id, ac.chunk_index, ac.content
-                 FROM atom_chunks ac
-                 INNER JOIN atom_tags at ON ac.atom_id = at.atom_id
-                 WHERE at.tag_id = ANY($1) AND ac.db_id = $2 AND at.db_id = $2
-                 ORDER BY ac.atom_id, ac.chunk_index",
+                "SELECT atom_id, chunk_index, content FROM atom_chunks
+                 WHERE atom_id = ANY($1) AND db_id = $2
+                 ORDER BY atom_id, chunk_index",
             )
-            .bind(&all_tag_ids)
+            .bind(&scoped_atom_ids)
             .bind(&self.db_id)
             .fetch_all(&self.pool)
             .await
@@ -523,7 +531,10 @@ impl WikiStore for PostgresStorage {
             ));
         }
 
-        let atom_count = self.count_atoms_with_tags(&all_tag_ids).await?;
+        // Count matches the scope used above — both kind-filtered.
+        let atom_count = self
+            .count_atoms_with_tags(&all_tag_ids, &captured_kinds)
+            .await?;
         Ok((chunks, atom_count))
     }
 
@@ -533,7 +544,11 @@ impl WikiStore for PostgresStorage {
         last_update: &str,
         max_source_tokens: usize,
     ) -> StorageResult<Option<(Vec<ChunkWithContext>, i32)>> {
-        // Get atoms added after the last update, spanning the full tag hierarchy.
+        use crate::storage::TagStore;
+
+        // Captured-only — see get_wiki_source_chunks for why the kind filter
+        // must apply at scope-resolution.
+        let captured_kinds = crate::models::KindFilter::only(crate::models::AtomKind::Captured);
         let new_atom_ids: Vec<String> = sqlx::query_scalar(
             "WITH RECURSIVE descendant_tags(id) AS (
                  SELECT $1
@@ -544,11 +559,13 @@ impl WikiStore for PostgresStorage {
              SELECT DISTINCT a.id FROM atoms a
              INNER JOIN atom_tags at ON a.id = at.atom_id
              WHERE at.tag_id IN (SELECT id FROM descendant_tags)
-               AND a.created_at > $2 AND a.db_id = $3 AND at.db_id = $3",
+               AND a.created_at > $2 AND a.db_id = $3 AND at.db_id = $3
+               AND a.kind = ANY($4)",
         )
         .bind(tag_id)
         .bind(last_update)
         .bind(&self.db_id)
+        .bind(captured_kinds.kind_strings())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AtomicCoreError::Wiki(e.to_string()))?;
@@ -665,24 +682,15 @@ impl WikiStore for PostgresStorage {
             ));
         }
 
-        // Count uses the same descendant CTE as get_article_status.
-        let atom_count: Option<i64> = sqlx::query_scalar(
-            "WITH RECURSIVE descendant_tags(id) AS (
-                 SELECT $1
-                 UNION ALL
-                 SELECT t.id FROM tags t
-                 INNER JOIN descendant_tags dt ON t.parent_id = dt.id
-             )
-             SELECT COUNT(DISTINCT atom_id) FROM atom_tags
-             WHERE tag_id IN (SELECT id FROM descendant_tags) AND db_id = $2",
-        )
-        .bind(tag_id)
-        .bind(&self.db_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| AtomicCoreError::Wiki(e.to_string()))?;
+        // Count must be consistent with the source-chunk path: captured-only
+        // total under the tag hierarchy. Otherwise the stored `atom_count`
+        // tracks a different population than what generation/update sourced.
+        let all_tag_ids = self.get_tag_hierarchy(tag_id).await?;
+        let atom_count = self
+            .count_atoms_with_tags(&all_tag_ids, &captured_kinds)
+            .await?;
 
-        Ok(Some((new_chunks, atom_count.unwrap_or(0) as i32)))
+        Ok(Some((new_chunks, atom_count)))
     }
 
     async fn get_suggested_wiki_articles(

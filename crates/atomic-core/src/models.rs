@@ -6,6 +6,140 @@ use serde::{Deserialize, Serialize};
 
 // ==================== Core KB Types ====================
 
+/// Discriminator distinguishing user-captured atoms from agent-emitted ones.
+///
+/// Every atom has exactly one kind. `Captured` is the default and the only
+/// value any production write path currently produces; `Report` is reserved
+/// for finding atoms emitted by scheduled report runs (see
+/// `docs/plans/reports.md`).
+///
+/// Variants serialize as lowercase strings (`"captured"`, `"report"`) to
+/// match the SQL column values exactly. The string form is the storage
+/// boundary; everywhere else in Rust this enum is the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtomKind {
+    Captured,
+    Report,
+}
+
+impl Default for AtomKind {
+    fn default() -> Self {
+        AtomKind::Captured
+    }
+}
+
+impl AtomKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AtomKind::Captured => "captured",
+            AtomKind::Report => "report",
+        }
+    }
+}
+
+impl std::fmt::Display for AtomKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AtomKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "captured" => Ok(AtomKind::Captured),
+            "report" => Ok(AtomKind::Report),
+            other => Err(format!("unknown AtomKind: {other}")),
+        }
+    }
+}
+
+/// Discriminator filter for atom queries.
+///
+/// Storage methods that return atoms for context assembly take `KindFilter`
+/// as a **non-defaulted** parameter — every call site must decide whether to
+/// include all kinds (`All`) or restrict to a subset (`Only`). Using an empty
+/// `Only(vec![])` is treated defensively as "match nothing" rather than
+/// silently degrading to no filter; the audit table in `docs/plans/reports.md`
+/// describes the intended choice for each consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindFilter {
+    All,
+    Only(Vec<AtomKind>),
+}
+
+impl KindFilter {
+    /// Convenience constructor for the common single-kind case.
+    pub fn only(kind: AtomKind) -> Self {
+        KindFilter::Only(vec![kind])
+    }
+
+    /// Returns `None` when no filtering applies; otherwise the subset.
+    /// Backends build their own `kind IN (...)` clause from this so neither
+    /// SQLite (`?`) nor Postgres (`$N`) placeholder dialects leak into the
+    /// type itself.
+    pub fn as_slice(&self) -> Option<&[AtomKind]> {
+        match self {
+            KindFilter::All => None,
+            KindFilter::Only(v) => Some(v.as_slice()),
+        }
+    }
+
+    /// Postgres predicate fragment using `= ANY($placeholder)`. The caller
+    /// supplies the placeholder it intends to bind to (e.g. `"$3"`) and is
+    /// responsible for binding the `Vec<String>` from [`Self::kind_strings`]
+    /// at that position. `All` returns a no-op `"true"`; an empty `Only`
+    /// returns `"false"` (defensive match-nothing).
+    pub fn postgres_predicate(&self, col: &str, placeholder: &str) -> String {
+        match self {
+            KindFilter::All => "true".to_string(),
+            KindFilter::Only(v) if v.is_empty() => "false".to_string(),
+            KindFilter::Only(_) => format!("{col} = ANY({placeholder})"),
+        }
+    }
+
+    /// The value vector to bind alongside [`Self::postgres_predicate`]. Empty
+    /// for `All` (no placeholder to bind); empty for empty `Only` (the
+    /// predicate is `false` so no bind position exists). Otherwise the kind
+    /// values as strings.
+    pub fn kind_strings(&self) -> Vec<String> {
+        match self {
+            KindFilter::All => Vec::new(),
+            KindFilter::Only(v) => v.iter().map(|k| k.as_str().to_string()).collect(),
+        }
+    }
+
+    /// True only when [`Self::postgres_predicate`] introduces an `$N`
+    /// placeholder that requires a corresponding `.bind(kind_strings())`.
+    /// `All` (`"true"`) and empty `Only` (`"false"`) emit no placeholder.
+    pub fn has_bind_value(&self) -> bool {
+        matches!(self, KindFilter::Only(v) if !v.is_empty())
+    }
+
+    /// Build an always-safe SQL fragment for splicing after `AND`/`WHERE`.
+    /// - `All`: `"1 = 1"` (no-op, lets the surrounding query stay structurally uniform).
+    /// - `Only([])`: `"1 = 0"` (defensive "match nothing").
+    /// - `Only([...])`: `"<col> IN (?, ?, ...)"` with `?` placeholders matching
+    ///   the SQLite dialect. Returns the matching bind values in order.
+    pub fn sqlite_in_clause(&self, col: &str) -> (String, Vec<&'static str>) {
+        match self {
+            KindFilter::All => ("1 = 1".to_string(), Vec::new()),
+            KindFilter::Only(kinds) if kinds.is_empty() => ("1 = 0".to_string(), Vec::new()),
+            KindFilter::Only(kinds) => {
+                let placeholders = std::iter::repeat("?")
+                    .take(kinds.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let frag = format!("{col} IN ({placeholders})");
+                let binds = kinds.iter().map(|k| k.as_str()).collect();
+                (frag, binds)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Atom {
@@ -22,6 +156,10 @@ pub struct Atom {
     pub tagging_status: String,   // 'pending', 'processing', 'complete', 'failed', 'skipped'
     pub embedding_error: Option<String>,
     pub tagging_error: Option<String>,
+    /// Discriminates user-captured atoms from agent-emitted findings.
+    /// Backwards-compatible default for clients that don't send the field.
+    #[serde(default)]
+    pub kind: AtomKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

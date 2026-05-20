@@ -82,9 +82,17 @@ pub async fn run_briefing(
     let since_str = since.to_rfc3339();
     tracing::info!(since = %since_str, "[briefing] Starting daily briefing run");
 
+    // Briefings synthesize from user-captured atoms. Once reports are
+    // landing finding atoms, including them here would loop agent output
+    // back into the next day's briefing — the precise feedback path the
+    // `kind` discriminator exists to prevent.
     let new_atoms = core
         .storage()
-        .list_new_atoms_since_sync(&since_str, MAX_NEW_ATOMS as i32)
+        .list_new_atoms_since_sync(
+            &since_str,
+            MAX_NEW_ATOMS as i32,
+            &crate::models::KindFilter::only(crate::models::AtomKind::Captured),
+        )
         .await?;
     let total_new = core
         .storage()

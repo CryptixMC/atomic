@@ -179,6 +179,7 @@ impl SqliteStorage {
         limit: i32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
         let conn = self.db.read_conn()?;
 
@@ -200,6 +201,18 @@ impl SqliteStorage {
             raw_results
                 .into_iter()
                 .filter(|r| matching.contains(r.1.as_str()))
+                .collect()
+        };
+
+        // Apply kind filter (post-pass — keeps FTS helper kind-agnostic)
+        let filtered = if matches!(kinds, crate::models::KindFilter::All) {
+            filtered
+        } else {
+            let candidate_atom_ids: Vec<&str> = filtered.iter().map(|r| r.1.as_str()).collect();
+            let allowed = batch_atoms_matching_kind(&conn, &candidate_atom_ids, kinds)?;
+            filtered
+                .into_iter()
+                .filter(|r| allowed.contains(&r.1))
                 .collect()
         };
 
@@ -229,6 +242,7 @@ impl SqliteStorage {
         threshold: f32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
         let query_blob = f32_vec_to_blob_public(query_embedding);
         let conn = self.db.read_conn()?;
@@ -256,12 +270,31 @@ impl SqliteStorage {
             std::collections::HashSet::new()
         };
 
+        // Apply kind filter
+        let kind_allowed: Option<std::collections::HashSet<String>> =
+            if matches!(kinds, crate::models::KindFilter::All) {
+                None
+            } else {
+                let candidate_atom_ids: Vec<&str> =
+                    chunk_map.values().map(|(aid, _, _)| aid.as_str()).collect();
+                Some(batch_atoms_matching_kind(
+                    &conn,
+                    &candidate_atom_ids,
+                    kinds,
+                )?)
+            };
+
         let mut results = Vec::new();
         for (chunk_id, distance) in &filtered {
             let similarity = distance_to_similarity(*distance);
             if let Some((atom_id, content, chunk_index)) = chunk_map.get(chunk_id) {
                 if !scope_tag_ids.is_empty() && !scope_atom_ids.contains(atom_id) {
                     continue;
+                }
+                if let Some(allowed) = &kind_allowed {
+                    if !allowed.contains(atom_id) {
+                        continue;
+                    }
                 }
                 results.push(ChunkSearchResult {
                     chunk_id: chunk_id.clone(),
@@ -385,17 +418,20 @@ impl SearchStore for SqliteStorage {
         limit: i32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
         let storage = self.clone();
         let query = query.to_string();
         let scope_tag_ids = scope_tag_ids.to_vec();
         let created_after = created_after.map(|s| s.to_string());
+        let kinds = kinds.clone();
         tokio::task::spawn_blocking(move || {
             storage.keyword_search_chunks_sync(
                 &query,
                 limit,
                 &scope_tag_ids,
                 created_after.as_deref(),
+                &kinds,
             )
         })
         .await
@@ -409,11 +445,13 @@ impl SearchStore for SqliteStorage {
         threshold: f32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
         let storage = self.clone();
         let query_embedding = query_embedding.to_vec();
         let scope_tag_ids = scope_tag_ids.to_vec();
         let created_after = created_after.map(|s| s.to_string());
+        let kinds = kinds.clone();
         tokio::task::spawn_blocking(move || {
             storage.vector_search_chunks_sync(
                 &query_embedding,
@@ -421,6 +459,7 @@ impl SearchStore for SqliteStorage {
                 threshold,
                 &scope_tag_ids,
                 created_after.as_deref(),
+                &kinds,
             )
         })
         .await
@@ -1232,6 +1271,49 @@ fn batch_atoms_with_scope_tags(
                 AtomicCoreError::Search(format!("Failed to read scope result: {}", e))
             })?,
         );
+    }
+    Ok(matching)
+}
+
+/// Batch lookup of which atom_ids match the given `KindFilter`. Returns the
+/// subset that passes. `KindFilter::All` is handled by the caller (no query).
+fn batch_atoms_matching_kind(
+    conn: &rusqlite::Connection,
+    atom_ids: &[&str],
+    kinds: &crate::models::KindFilter,
+) -> Result<std::collections::HashSet<String>, AtomicCoreError> {
+    if atom_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let (kind_frag, kind_binds) = kinds.sqlite_in_clause("kind");
+    let atom_placeholders: Vec<&str> = atom_ids.iter().map(|_| "?").collect();
+    let query = format!(
+        "SELECT id FROM atoms WHERE id IN ({}) AND {kind_frag}",
+        atom_placeholders.join(",")
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        Vec::with_capacity(atom_ids.len() + kind_binds.len());
+    for id in atom_ids {
+        params.push(id);
+    }
+    for v in &kind_binds {
+        params.push(v as &dyn rusqlite::ToSql);
+    }
+    let mut stmt = conn.prepare(&query).map_err(|e| {
+        AtomicCoreError::Search(format!("Failed to prepare kind-scope query: {}", e))
+    })?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| {
+            AtomicCoreError::Search(format!("Failed to execute kind-scope query: {}", e))
+        })?;
+    let mut matching = std::collections::HashSet::new();
+    for row in rows {
+        matching.insert(row.map_err(|e| {
+            AtomicCoreError::Search(format!("Failed to read kind-scope result: {}", e))
+        })?);
     }
     Ok(matching)
 }

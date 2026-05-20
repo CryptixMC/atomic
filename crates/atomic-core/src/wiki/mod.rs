@@ -774,15 +774,29 @@ pub(crate) fn get_tag_hierarchy(conn: &Connection, tag_id: &str) -> Result<Vec<S
 }
 
 /// Count atoms with any of the given tags
-pub(crate) fn count_atoms_with_tags(conn: &Connection, tag_ids: &[String]) -> Result<i32, String> {
+pub(crate) fn count_atoms_with_tags(
+    conn: &Connection,
+    tag_ids: &[String],
+    kinds: &crate::models::KindFilter,
+) -> Result<i32, String> {
     let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let (kind_frag, kind_binds) = kinds.sqlite_in_clause("atoms.kind");
     let query = format!(
-        "SELECT COUNT(DISTINCT atom_id) FROM atom_tags WHERE tag_id IN ({})",
-        placeholders
+        "SELECT COUNT(DISTINCT atom_tags.atom_id) FROM atom_tags
+         INNER JOIN atoms ON atoms.id = atom_tags.atom_id
+         WHERE atom_tags.tag_id IN ({placeholders}) AND {kind_frag}"
     );
-    conn.query_row(&query, rusqlite::params_from_iter(tag_ids), |row| {
-        row.get(0)
-    })
+    // tag_ids first, then kind binds.
+    let mut bind_refs: Vec<&dyn rusqlite::ToSql> =
+        tag_ids.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+    for v in &kind_binds {
+        bind_refs.push(v as &dyn rusqlite::ToSql);
+    }
+    conn.query_row(
+        &query,
+        rusqlite::params_from_iter(bind_refs.iter()),
+        |row| row.get(0),
+    )
     .map_err(|e| format!("Failed to count atoms: {}", e))
 }
 

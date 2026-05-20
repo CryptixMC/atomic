@@ -1247,19 +1247,34 @@ impl TagStore for PostgresStorage {
         Ok(rows)
     }
 
-    async fn count_atoms_with_tags(&self, tag_ids: &[String]) -> StorageResult<i32> {
+    async fn count_atoms_with_tags(
+        &self,
+        tag_ids: &[String],
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
         if tag_ids.is_empty() {
             return Ok(0);
         }
-        // Postgres doesn't support IN with bound array easily, so use ANY
-        let count: Option<i64> = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT atom_id) FROM atom_tags WHERE tag_id = ANY($1) AND db_id = $2",
-        )
-        .bind(tag_ids)
-        .bind(&self.db_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        // Join through atoms so the kind filter can be applied. db_id keeps
+        // the count scoped to the active database. Postgres uses ANY for the
+        // tag_ids list and (when filtering) for the kinds list.
+        let kind_predicate = kinds.postgres_predicate("a.kind", "$3");
+        let sql = format!(
+            "SELECT COUNT(DISTINCT at.atom_id)
+             FROM atom_tags at
+             INNER JOIN atoms a ON a.id = at.atom_id AND a.db_id = at.db_id
+             WHERE at.tag_id = ANY($1) AND at.db_id = $2 AND {kind_predicate}"
+        );
+        let mut q = sqlx::query_scalar::<_, Option<i64>>(&sql)
+            .bind(tag_ids)
+            .bind(&self.db_id);
+        if kinds.has_bind_value() {
+            q = q.bind(kinds.kind_strings());
+        }
+        let count = q
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         Ok(count.unwrap_or(0) as i32)
     }

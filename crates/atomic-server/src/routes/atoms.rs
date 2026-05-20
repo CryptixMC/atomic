@@ -74,7 +74,12 @@ pub async fn get_atoms(db: Db, query: web::Query<GetAtomsQuery>) -> HttpResponse
         sort_by,
         sort_order,
     };
-    ok_or_error(db.0.list_atoms(&params).await)
+    // UI listing is a display surface; show all kinds (visual differentiation
+    // of report findings is a future phase concern).
+    ok_or_error(
+        db.0.list_atoms(&params, &atomic_core::models::KindFilter::All)
+            .await,
+    )
 }
 
 #[utoipa::path(
