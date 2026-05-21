@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 18;
+    const LATEST_VERSION: i32 = 19;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -884,6 +884,42 @@ impl Database {
                      CREATE INDEX IF NOT EXISTS idx_atoms_kind ON atoms(kind);",
                 )?;
             }
+
+            conn.execute_batch("PRAGMA user_version = 18;")?;
+        }
+
+        // V19: task_runs execution ledger.
+        // Per-DB ledger of scheduled-task executions. Reports (phase 2) will be
+        // the first writer; phase 1.5 ships the table + helpers dormant so the
+        // claim / lease / crash-recovery semantics are exercised by tests
+        // before any production caller depends on them.
+        if version < 19 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS task_runs (
+                     id              TEXT PRIMARY KEY,
+                     task_id         TEXT NOT NULL,
+                     subject_id      TEXT,
+                     state           TEXT NOT NULL DEFAULT 'pending',
+                     trigger         TEXT NOT NULL,
+                     attempts        INTEGER NOT NULL DEFAULT 0,
+                     max_attempts    INTEGER NOT NULL DEFAULT 3,
+                     lease_until     TEXT,
+                     next_attempt_at TEXT NOT NULL,
+                     scope           TEXT,
+                     result_id       TEXT,
+                     last_error      TEXT,
+                     started_at      TEXT,
+                     finished_at     TEXT,
+                     created_at      TEXT NOT NULL,
+                     updated_at      TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_task_runs_claim
+                     ON task_runs(state, next_attempt_at);
+                 CREATE INDEX IF NOT EXISTS idx_task_runs_lease
+                     ON task_runs(state, lease_until);
+                 CREATE INDEX IF NOT EXISTS idx_task_runs_history
+                     ON task_runs(task_id, subject_id, created_at);",
+            )?;
 
             conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
         }

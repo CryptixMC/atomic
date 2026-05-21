@@ -13,6 +13,7 @@ mod feeds;
 mod search;
 mod settings;
 mod tags;
+mod task_runs;
 mod wiki;
 
 use crate::db::Database;

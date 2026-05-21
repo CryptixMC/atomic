@@ -5875,4 +5875,738 @@ mod tests {
         assert!(!atom_ids.contains(report.atom.id.as_str()));
         assert!(atom_ids.contains(captured.atom.id.as_str()));
     }
+
+    // ==================== task_runs execution ledger (V19) ====================
+    //
+    // Phase 1.5 ships the ledger plumbing dormant — these tests are the
+    // production proof that the conditional-update predicates, lease
+    // semantics, and retry/abandon branches behave as the plan doc spec'd
+    // before phase 2 (reports) wires up a real caller.
+
+    use crate::models::{TaskRun, TaskRunState, TaskRunTrigger};
+    use crate::scheduler::ledger;
+    use chrono::Utc;
+
+    /// Build a freshly-pending row at `now` with the supplied attempts.
+    /// Returns the inserted row by id (re-read so timestamps round-trip
+    /// through the storage layer exactly as production callers would see).
+    async fn insert_pending_run(
+        db: &AtomicCore,
+        task_id: &str,
+        now: chrono::DateTime<Utc>,
+        max_attempts: i32,
+    ) -> TaskRun {
+        let id = uuid::Uuid::now_v7().to_string();
+        let now_str = now.to_rfc3339();
+        let row = TaskRun {
+            id: id.clone(),
+            task_id: task_id.to_string(),
+            subject_id: None,
+            state: TaskRunState::Pending,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 0,
+            max_attempts,
+            lease_until: None,
+            next_attempt_at: now_str.clone(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: None,
+            finished_at: None,
+            created_at: now_str.clone(),
+            updated_at: now_str,
+        };
+        db.storage.insert_task_run_sync(&row).await.unwrap();
+        db.storage.get_task_run_sync(&id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn ledger_insert_and_read_round_trip() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let back = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.id, row.id);
+        assert_eq!(back.state, TaskRunState::Pending);
+        assert_eq!(back.trigger, TaskRunTrigger::Schedule);
+        assert_eq!(back.attempts, 0);
+        assert_eq!(back.max_attempts, 3);
+        assert!(back.lease_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_pending_claim_wins_exactly_once_under_contention() {
+        // The conditional UPDATE `state = 'pending'` predicate is the only
+        // guard against double-claim. Hammer it from many tasks at once and
+        // confirm exactly one wins.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let lease_until = (now + chrono::Duration::minutes(15)).to_rfc3339();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let storage = db.storage.clone();
+            let id = row.id.clone();
+            let now_str = now.to_rfc3339();
+            let lease = lease_until.clone();
+            handles.push(tokio::spawn(async move {
+                storage
+                    .claim_pending_task_run_sync(&id, &now_str, &lease)
+                    .await
+            }));
+        }
+
+        let mut wins = 0;
+        for h in handles {
+            if h.await.unwrap().unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1, "exactly one claimant should win");
+
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, TaskRunState::Running);
+        assert_eq!(after.attempts, 1, "claim should bump attempts by one");
+        assert!(after.lease_until.is_some());
+        assert!(after.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn ledger_running_with_live_lease_blocks_second_claim() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+
+        // Second pending-claim should fail (state is now 'running').
+        assert!(!db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+
+        // And the reclaim path should fail too — lease is still live.
+        let still_now = now.to_rfc3339();
+        assert!(!db
+            .storage
+            .reclaim_expired_task_run_sync(&row.id, &still_now, &lease)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn ledger_expired_lease_reclaimed_without_bumping_attempts() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+
+        // First claim, attempts → 1.
+        let stale_lease = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &stale_lease)
+            .await
+            .unwrap());
+        let after_claim = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_claim.attempts, 1);
+
+        // Pretend a process crash happened — lease is already in the past.
+        // Reclaim should succeed and leave attempts at 1.
+        let later = now + chrono::Duration::minutes(2);
+        let fresh_lease = (later + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .reclaim_expired_task_run_sync(&row.id, &later.to_rfc3339(), &fresh_lease)
+            .await
+            .unwrap());
+        let after_reclaim = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_reclaim.attempts, 1,
+            "reclaim must NOT bump attempts — process crash isn't a logic failure"
+        );
+        assert_eq!(after_reclaim.state, TaskRunState::Running);
+        assert_eq!(
+            after_reclaim.lease_until.as_deref(),
+            Some(fresh_lease.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_heartbeat_extends_lease_only_when_running() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+
+        // Heartbeat on a pending row is a no-op (state predicate fails
+        // before the lease fence is even checked).
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(!db
+            .storage
+            .heartbeat_task_run_sync(&row.id, &lease, &lease)
+            .await
+            .unwrap());
+
+        // Claim, then heartbeat extends.
+        let first_lease = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &first_lease)
+            .await
+            .unwrap());
+        let new_lease = (now + chrono::Duration::minutes(20)).to_rfc3339();
+        assert!(db
+            .storage
+            .heartbeat_task_run_sync(&row.id, &first_lease, &new_lease)
+            .await
+            .unwrap());
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.lease_until.as_deref(), Some(new_lease.as_str()));
+    }
+
+    #[tokio::test]
+    async fn ledger_complete_is_terminal_and_clears_lease() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+        assert!(db
+            .storage
+            .complete_task_run_sync(&row.id, &lease, Some("result-atom-1"), &now.to_rfc3339())
+            .await
+            .unwrap());
+
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, TaskRunState::Succeeded);
+        assert_eq!(after.result_id.as_deref(), Some("result-atom-1"));
+        assert!(after.finished_at.is_some());
+        assert!(after.lease_until.is_none());
+
+        // A second complete on a terminal row is a no-op.
+        assert!(!db
+            .storage
+            .complete_task_run_sync(&row.id, &lease, Some("result-atom-2"), &now.to_rfc3339())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn ledger_fail_retry_under_max_routes_back_to_pending() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+
+        let next_attempt = (now + chrono::Duration::minutes(2)).to_rfc3339();
+        assert!(db
+            .storage
+            .fail_task_run_retry_sync(&row.id, &lease, "boom", &now.to_rfc3339(), &next_attempt)
+            .await
+            .unwrap());
+
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, TaskRunState::Pending);
+        assert_eq!(after.next_attempt_at, next_attempt);
+        assert_eq!(after.last_error.as_deref(), Some("boom"));
+        assert!(after.lease_until.is_none());
+        assert!(after.started_at.is_none());
+        // attempts was bumped by the claim and stays at 1 on retry — the
+        // claim is the canonical "started an attempt" marker.
+        assert_eq!(after.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn ledger_fail_abandon_is_terminal() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 1).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+
+        assert!(db
+            .storage
+            .fail_task_run_abandon_sync(&row.id, &lease, "stop", &now.to_rfc3339())
+            .await
+            .unwrap());
+
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, TaskRunState::Abandoned);
+        assert_eq!(after.last_error.as_deref(), Some("stop"));
+        assert!(after.finished_at.is_some());
+        assert!(after.lease_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_find_runnable_prefers_earliest_next_attempt() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let earlier = insert_pending_run(&db, "task-A", now, 3).await;
+        // Bump the second row's next_attempt_at into the future via insert
+        // then read-back; easier than reaching into the trait again.
+        let later_id = uuid::Uuid::now_v7().to_string();
+        let later_at = (now + chrono::Duration::minutes(10)).to_rfc3339();
+        let later_row = TaskRun {
+            id: later_id.clone(),
+            task_id: "task-A".to_string(),
+            subject_id: None,
+            state: TaskRunState::Pending,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 0,
+            max_attempts: 3,
+            lease_until: None,
+            next_attempt_at: later_at.clone(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: None,
+            finished_at: None,
+            created_at: later_at.clone(),
+            updated_at: later_at,
+        };
+        db.storage.insert_task_run_sync(&later_row).await.unwrap();
+
+        let picked = db
+            .storage
+            .find_runnable_task_run_sync("task-A", None, &now.to_rfc3339())
+            .await
+            .unwrap()
+            .expect("a runnable row");
+        assert_eq!(picked.id, earlier.id, "earliest next_attempt_at wins");
+    }
+
+    #[tokio::test]
+    async fn ledger_find_runnable_ignores_future_and_terminal_rows() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        // Future-pending row.
+        let future_id = uuid::Uuid::now_v7().to_string();
+        let future_at = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let future_row = TaskRun {
+            id: future_id,
+            task_id: "task-A".to_string(),
+            subject_id: None,
+            state: TaskRunState::Pending,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 0,
+            max_attempts: 3,
+            lease_until: None,
+            next_attempt_at: future_at.clone(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: None,
+            finished_at: None,
+            created_at: future_at.clone(),
+            updated_at: future_at,
+        };
+        db.storage.insert_task_run_sync(&future_row).await.unwrap();
+
+        // Succeeded row (terminal).
+        let done_id = uuid::Uuid::now_v7().to_string();
+        let done = TaskRun {
+            id: done_id,
+            task_id: "task-A".to_string(),
+            subject_id: None,
+            state: TaskRunState::Succeeded,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: None,
+            next_attempt_at: now.to_rfc3339(),
+            scope: None,
+            result_id: Some("a".to_string()),
+            last_error: None,
+            started_at: Some(now.to_rfc3339()),
+            finished_at: Some(now.to_rfc3339()),
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        db.storage.insert_task_run_sync(&done).await.unwrap();
+
+        assert!(db
+            .storage
+            .find_runnable_task_run_sync("task-A", None, &now.to_rfc3339())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_list_recent_orders_desc_and_respects_limit() {
+        let (db, _temp) = create_test_db().await;
+        let base = Utc::now();
+        for i in 0..5 {
+            let _ = insert_pending_run(&db, "task-A", base + chrono::Duration::seconds(i), 3).await;
+        }
+        let rows = db
+            .storage
+            .list_recent_task_runs_sync("task-A", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for w in rows.windows(2) {
+            assert!(
+                w[0].created_at >= w[1].created_at,
+                "descending by created_at"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ledger_claim_or_create_inserts_then_claims_when_no_row_exists() {
+        // High-level happy path: no existing row → fresh pending inserted,
+        // claim wins, RunHandle returned, complete succeeds.
+        let (db, _temp) = create_test_db().await;
+        let handle = ledger::claim_or_create(&db, "task-A", None, TaskRunTrigger::Manual, 3)
+            .await
+            .unwrap()
+            .expect("claimed");
+        let id = handle.run().id.clone();
+        let won = handle.complete(Some("atom-1".to_string())).await.unwrap();
+        assert!(won);
+
+        let after = db.storage.get_task_run_sync(&id).await.unwrap().unwrap();
+        assert_eq!(after.state, TaskRunState::Succeeded);
+        assert_eq!(after.trigger, TaskRunTrigger::Manual);
+    }
+
+    #[tokio::test]
+    async fn ledger_claim_or_create_skips_when_running_lease_is_live() {
+        // Regression for: when a task already has a running row with an
+        // unexpired lease, claim_or_create must NOT insert a duplicate
+        // pending row that gets claimed in parallel. The fix is the
+        // `find_active_task_run` probe that catches the live-leased row
+        // before the insert branch fires.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+
+        // Same task is already in flight — claim_or_create returns None.
+        let outcome = ledger::claim_or_create(&db, "task-A", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_none(),
+            "claim_or_create must not start a parallel run while a lease is live"
+        );
+
+        // And no duplicate row was inserted.
+        let history = db
+            .storage
+            .list_recent_task_runs_sync("task-A", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "no duplicate row inserted");
+    }
+
+    #[tokio::test]
+    async fn ledger_claim_or_create_skips_when_pending_backoff_unexpired() {
+        // Regression for the same dup-row class: a row that failed and
+        // backed off into pending with `next_attempt_at` in the future
+        // must also block a parallel claim_or_create from inserting a
+        // duplicate. The retry window is implicitly owned by whoever
+        // wrote the backoff timestamp.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let future_id = uuid::Uuid::now_v7().to_string();
+        let future_at = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        let row = TaskRun {
+            id: future_id,
+            task_id: "task-A".to_string(),
+            subject_id: None,
+            state: TaskRunState::Pending,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: None,
+            next_attempt_at: future_at.clone(),
+            scope: None,
+            result_id: None,
+            last_error: Some("transient".to_string()),
+            started_at: None,
+            finished_at: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        db.storage.insert_task_run_sync(&row).await.unwrap();
+
+        let outcome = ledger::claim_or_create(&db, "task-A", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_none(),
+            "future-backoff row blocks duplicate insert"
+        );
+
+        let history = db
+            .storage
+            .list_recent_task_runs_sync("task-A", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "no duplicate row inserted");
+    }
+
+    #[tokio::test]
+    async fn ledger_stale_complete_fenced_by_lease_after_reclaim() {
+        // Regression for: a worker whose lease has been reclaimed by a
+        // peer must not be able to mark the reclaimed (re-attempted) run
+        // as succeeded. The lease fence on terminal writers catches this.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+
+        // Worker A claims with an already-stale lease (lease_until < now).
+        let stale_lease = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &stale_lease)
+            .await
+            .unwrap());
+
+        // Worker B reclaims a few minutes later — sets a new lease value.
+        let later = now + chrono::Duration::minutes(2);
+        let fresh_lease = (later + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .reclaim_expired_task_run_sync(&row.id, &later.to_rfc3339(), &fresh_lease)
+            .await
+            .unwrap());
+
+        // Worker A finally returns and tries to complete with its OLD lease.
+        // Storage must refuse — the lease fence does not match.
+        let stale_complete = db
+            .storage
+            .complete_task_run_sync(
+                &row.id,
+                &stale_lease,
+                Some("A's result"),
+                &later.to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert!(!stale_complete, "stale complete must fail the lease fence");
+
+        // Same for retry / abandon.
+        let stale_retry = db
+            .storage
+            .fail_task_run_retry_sync(
+                &row.id,
+                &stale_lease,
+                "A's error",
+                &later.to_rfc3339(),
+                &(later + chrono::Duration::minutes(5)).to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert!(!stale_retry, "stale retry must fail the lease fence");
+
+        let stale_abandon = db
+            .storage
+            .fail_task_run_abandon_sync(&row.id, &stale_lease, "A's error", &later.to_rfc3339())
+            .await
+            .unwrap();
+        assert!(!stale_abandon, "stale abandon must fail the lease fence");
+
+        // Row is still running under B's lease — untouched.
+        let still = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.state, TaskRunState::Running);
+        assert_eq!(still.lease_until.as_deref(), Some(fresh_lease.as_str()));
+
+        // Worker B can complete using the fresh lease.
+        assert!(db
+            .storage
+            .complete_task_run_sync(
+                &row.id,
+                &fresh_lease,
+                Some("B's result"),
+                &later.to_rfc3339(),
+            )
+            .await
+            .unwrap());
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, TaskRunState::Succeeded);
+        assert_eq!(after.result_id.as_deref(), Some("B's result"));
+    }
+
+    #[tokio::test]
+    async fn ledger_stale_heartbeat_fenced_by_lease_after_reclaim() {
+        // The heartbeat path uses the same fence — worker A's extension
+        // must not silently overwrite worker B's freshly-reclaimed lease.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+
+        let stale_lease = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &stale_lease)
+            .await
+            .unwrap());
+
+        let later = now + chrono::Duration::minutes(2);
+        let fresh_lease = (later + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .reclaim_expired_task_run_sync(&row.id, &later.to_rfc3339(), &fresh_lease)
+            .await
+            .unwrap());
+
+        let extended_by_a = (later + chrono::Duration::minutes(30)).to_rfc3339();
+        let stale_heartbeat = db
+            .storage
+            .heartbeat_task_run_sync(&row.id, &stale_lease, &extended_by_a)
+            .await
+            .unwrap();
+        assert!(
+            !stale_heartbeat,
+            "stale heartbeat must fail the lease fence"
+        );
+
+        let after = db
+            .storage
+            .get_task_run_sync(&row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.lease_until.as_deref(),
+            Some(fresh_lease.as_str()),
+            "B's lease must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_find_active_returns_running_row_regardless_of_lease() {
+        // find_active is the probe claim_or_create uses to detect "task
+        // already has work in flight". It must return rows that
+        // find_runnable_task_run would skip — specifically, running rows
+        // with a live lease.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let live_lease = (now + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &live_lease)
+            .await
+            .unwrap());
+
+        // find_runnable skips it (live lease).
+        assert!(db
+            .storage
+            .find_runnable_task_run_sync("task-A", None, &now.to_rfc3339())
+            .await
+            .unwrap()
+            .is_none());
+
+        // find_active returns it.
+        let active = db
+            .storage
+            .find_active_task_run_sync("task-A", None)
+            .await
+            .unwrap()
+            .expect("active row");
+        assert_eq!(active.id, row.id);
+        assert_eq!(active.state, TaskRunState::Running);
+    }
+
+    #[tokio::test]
+    async fn ledger_find_active_ignores_terminal_rows() {
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now, 1).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(db
+            .storage
+            .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+            .await
+            .unwrap());
+        assert!(db
+            .storage
+            .complete_task_run_sync(&row.id, &lease, Some("done"), &now.to_rfc3339())
+            .await
+            .unwrap());
+
+        assert!(db
+            .storage
+            .find_active_task_run_sync("task-A", None)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

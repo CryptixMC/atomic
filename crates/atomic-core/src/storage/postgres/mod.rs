@@ -25,6 +25,8 @@ mod settings;
 #[cfg(feature = "postgres")]
 mod tags;
 #[cfg(feature = "postgres")]
+mod task_runs;
+#[cfg(feature = "postgres")]
 mod wiki;
 
 #[cfg(feature = "postgres")]
@@ -110,6 +112,7 @@ impl PostgresStorage {
             (12, include_str!("migrations/012_autotag_description.sql")),
             (13, include_str!("migrations/013_atom_tags_source.sql")),
             (14, include_str!("migrations/014_atoms_kind.sql")),
+            (15, include_str!("migrations/015_task_runs.sql")),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations

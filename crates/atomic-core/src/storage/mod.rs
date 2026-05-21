@@ -275,6 +275,7 @@ impl_reborrow_struct!(
     WikiProposal,
     crate::briefing::Briefing,
     crate::models::KindFilter,
+    crate::models::TaskRun,
 );
 
 /// Macro to generate async dispatch methods. For each method:
@@ -290,6 +291,12 @@ macro_rules! dispatch {
     ) => {
         impl StorageBackend {
             $(
+                // Some dispatch entries are dormant in non-test builds —
+                // they exist to round out the storage surface for upcoming
+                // phases (e.g. task_runs history before the reports UI
+                // ships). Suppress the noise; missing-impl regressions
+                // would still fail to compile.
+                #[allow(dead_code)]
                 pub(crate) async fn $name(&self $(, $arg: $argty)*) -> $ret {
                     match self {
                         StorageBackend::Sqlite(s) => {
@@ -622,6 +629,30 @@ dispatch! {
         => sqlite: migrate_legacy_token_sync, pg_trait: TokenStore, pg_method: migrate_legacy_token;
     fn ensure_default_token_sync(&self) -> Result<Option<(crate::tokens::ApiTokenInfo, String)>, AtomicCoreError>
         => sqlite: ensure_default_token_sync, pg_trait: TokenStore, pg_method: ensure_default_token;
+
+    // ---- TaskRunStore ----
+    fn insert_task_run_sync(&self, run: &crate::models::TaskRun) -> Result<(), AtomicCoreError>
+        => sqlite: insert_task_run_sync, pg_trait: TaskRunStore, pg_method: insert_task_run;
+    fn get_task_run_sync(&self, id: &str) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: get_task_run_sync, pg_trait: TaskRunStore, pg_method: get_task_run;
+    fn find_runnable_task_run_sync(&self, task_id: &str, subject_id: Option<&str>, now: &str) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: find_runnable_task_run_sync, pg_trait: TaskRunStore, pg_method: find_runnable_task_run;
+    fn find_active_task_run_sync(&self, task_id: &str, subject_id: Option<&str>) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: find_active_task_run_sync, pg_trait: TaskRunStore, pg_method: find_active_task_run;
+    fn claim_pending_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: claim_pending_task_run_sync, pg_trait: TaskRunStore, pg_method: claim_pending_task_run;
+    fn reclaim_expired_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: reclaim_expired_task_run_sync, pg_trait: TaskRunStore, pg_method: reclaim_expired_task_run;
+    fn heartbeat_task_run_sync(&self, id: &str, expected_lease: &str, new_lease_until: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: heartbeat_task_run_sync, pg_trait: TaskRunStore, pg_method: heartbeat_task_run;
+    fn complete_task_run_sync(&self, id: &str, expected_lease: &str, result_id: Option<&str>, finished_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: complete_task_run_sync, pg_trait: TaskRunStore, pg_method: complete_task_run;
+    fn fail_task_run_retry_sync(&self, id: &str, expected_lease: &str, last_error: &str, now: &str, next_attempt_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: fail_task_run_retry_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_retry;
+    fn fail_task_run_abandon_sync(&self, id: &str, expected_lease: &str, last_error: &str, finished_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: fail_task_run_abandon_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_abandon;
+    fn list_recent_task_runs_sync(&self, task_id: &str, subject_id: Option<&str>, limit: i32) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: list_recent_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_recent_task_runs;
 }
 
 #[cfg(feature = "postgres")]

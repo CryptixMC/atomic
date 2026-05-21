@@ -8,6 +8,7 @@
 //! Tasks are responsible for their own enablement / due-ness checks, state
 //! persistence, and event reporting — see [`ScheduledTask::run`].
 
+pub mod ledger;
 pub mod state;
 
 use async_trait::async_trait;

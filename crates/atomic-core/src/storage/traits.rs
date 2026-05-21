@@ -984,6 +984,129 @@ pub trait DatabaseStore: Send + Sync {
     async fn purge_database_data(&self, db_id: &str) -> StorageResult<()>;
 }
 
+// ==================== Task Run Storage ====================
+
+/// Storage operations for the `task_runs` execution ledger.
+///
+/// The scheduler ledger (`scheduler::ledger`) composes these into a state
+/// machine; the trait itself is intentionally CRUD-shaped with the
+/// conditional-update predicate baked into each writer so the contention
+/// semantics live in SQL, not in Rust. See `docs/plans/reports.md`
+/// §"Execution ledger — task_runs" for the contract.
+#[async_trait]
+pub trait TaskRunStore: Send + Sync {
+    /// Insert a fresh run row (state is whatever the caller passes — typically
+    /// `pending`). The caller owns id and all timestamps.
+    async fn insert_task_run(&self, run: &crate::models::TaskRun) -> StorageResult<()>;
+
+    /// Read a single row by id.
+    async fn get_task_run(&self, id: &str) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Find the next-runnable row for `(task_id, subject_id)`: either a
+    /// `pending` row whose `next_attempt_at <= now`, or a `running` row whose
+    /// `lease_until < now` (crash-recovery candidate). Returns the row with
+    /// the earliest `next_attempt_at` first.
+    async fn find_runnable_task_run(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+        now: &str,
+    ) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Find any non-terminal row for `(task_id, subject_id)` regardless of
+    /// timing — i.e., pending OR running, with `next_attempt_at` and
+    /// `lease_until` ignored. The intended caller is `claim_or_create`: if
+    /// a non-runnable active row exists (e.g., running with a live lease, or
+    /// pending with `next_attempt_at` in the future), inserting a fresh
+    /// pending row would race past it and start a duplicate execution.
+    /// Most-recent first.
+    async fn find_active_task_run(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+    ) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Conditional `pending → running` transition. Returns `true` iff this
+    /// caller won the claim (predicate `id = ? AND state = 'pending'` held).
+    /// On success, sets `started_at`, `lease_until`, `updated_at`, and bumps
+    /// `attempts` by 1.
+    async fn claim_pending_task_run(
+        &self,
+        id: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> StorageResult<bool>;
+
+    /// Conditional crash-recovery reclaim. Predicate is
+    /// `id = ? AND state = 'running' AND lease_until < ?`. On success, sets a
+    /// fresh `lease_until` and `started_at`, leaves `attempts` untouched
+    /// (we don't punish a process crash as a logic failure).
+    async fn reclaim_expired_task_run(
+        &self,
+        id: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> StorageResult<bool>;
+
+    /// Conditional lease refresh used by the heartbeat task. Predicate is
+    /// `id = ? AND state = 'running' AND lease_until = expected_lease` —
+    /// the extra lease fence protects a slow worker against a peer that
+    /// reclaimed the row after the worker's lease expired (the peer would
+    /// have replaced our `lease_until` value, so our refresh no longer
+    /// matches). Returns `false` when the row has moved on (terminal state,
+    /// or reclaimed by another worker).
+    async fn heartbeat_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        new_lease_until: &str,
+    ) -> StorageResult<bool>;
+
+    /// Terminal `running → succeeded`. Predicate is
+    /// `id = ? AND state = 'running' AND lease_until = expected_lease` so a
+    /// stale worker whose lease was already reclaimed by a peer can't
+    /// double-complete a run that's been re-attempted underneath it.
+    async fn complete_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        result_id: Option<&str>,
+        finished_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// `running → pending` with `next_attempt_at` set in the future and the
+    /// stored `attempts` left at the current value (the claim already
+    /// incremented it). Clears `lease_until`. Same fenced predicate as
+    /// `complete_task_run`.
+    async fn fail_task_run_retry(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        now: &str,
+        next_attempt_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// Terminal `running → abandoned`. Same fenced predicate as the other
+    /// terminal writers.
+    async fn fail_task_run_abandon(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        finished_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// Most-recent-first run history for a task. `subject_id = None` matches
+    /// any subject_id (history-by-task); `Some(...)` filters to that subject.
+    async fn list_recent_task_runs(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+        limit: i32,
+    ) -> StorageResult<Vec<crate::models::TaskRun>>;
+}
+
 // ==================== Supertrait ====================
 
 /// Combined storage trait. Every storage backend must implement all sub-traits.
@@ -1003,6 +1126,7 @@ pub trait Storage:
     + SettingsStore
     + TokenStore
     + DatabaseStore
+    + TaskRunStore
     + Send
     + Sync
 {

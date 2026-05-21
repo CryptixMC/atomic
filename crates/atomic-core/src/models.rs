@@ -1011,3 +1011,140 @@ pub struct ExistingAtomChunk {
     pub chunk_index: i32,
     pub content: String,
 }
+
+// ==================== Task Runs (Execution Ledger) ====================
+
+/// State machine vertex for a single task run.
+///
+/// Transitions are governed by the scheduler ledger; see
+/// `docs/plans/reports.md` §"Execution ledger — task_runs".
+///
+/// - `Pending → Running`: claim succeeds.
+/// - `Running → Succeeded`: terminal success; result_id set.
+/// - `Running → Pending`: retryable failure; attempts incremented,
+///   next_attempt_at set to backed-off future.
+/// - `Running → Abandoned`: terminal failure after max_attempts exhausted.
+/// - `Running → Running`: crash recovery — a stale lease is reclaimed without
+///   incrementing attempts.
+///
+/// String form matches the SQL column values exactly. Empty / unknown values
+/// fail `FromStr` rather than defaulting silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Abandoned,
+}
+
+impl TaskRunState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TaskRunState::Pending => "pending",
+            TaskRunState::Running => "running",
+            TaskRunState::Succeeded => "succeeded",
+            TaskRunState::Failed => "failed",
+            TaskRunState::Abandoned => "abandoned",
+        }
+    }
+
+    /// True for terminal states that should never transition further.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskRunState::Succeeded | TaskRunState::Failed | TaskRunState::Abandoned
+        )
+    }
+}
+
+impl std::fmt::Display for TaskRunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskRunState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(TaskRunState::Pending),
+            "running" => Ok(TaskRunState::Running),
+            "succeeded" => Ok(TaskRunState::Succeeded),
+            "failed" => Ok(TaskRunState::Failed),
+            "abandoned" => Ok(TaskRunState::Abandoned),
+            other => Err(format!("unknown TaskRunState: {other}")),
+        }
+    }
+}
+
+/// What woke the scheduler up for this run. Used to disambiguate "the cron
+/// fired" from "the user clicked run-now" in run history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunTrigger {
+    Schedule,
+    Manual,
+}
+
+impl TaskRunTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TaskRunTrigger::Schedule => "schedule",
+            TaskRunTrigger::Manual => "manual",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskRunTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskRunTrigger {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "schedule" => Ok(TaskRunTrigger::Schedule),
+            "manual" => Ok(TaskRunTrigger::Manual),
+            other => Err(format!("unknown TaskRunTrigger: {other}")),
+        }
+    }
+}
+
+/// One row of the `task_runs` execution ledger.
+///
+/// Owned, deserialized form of the persisted record. The authoritative state
+/// is the row in the database; this struct is a transport for that row, never
+/// a cache. Mutating helpers on the ledger module return a fresh `TaskRun`
+/// rather than editing this one in place so callers don't accidentally rely
+/// on stale `lease_until` after a heartbeat.
+///
+/// Timestamps are RFC3339 strings on SQLite and `TIMESTAMPTZ` on Postgres;
+/// `scope` is a JSON snapshot of the resolved source scope written by the
+/// caller at claim time (phase 1.5 leaves it `None`; phase 2 reports populate
+/// it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TaskRun {
+    pub id: String,
+    pub task_id: String,
+    pub subject_id: Option<String>,
+    pub state: TaskRunState,
+    pub trigger: TaskRunTrigger,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub lease_until: Option<String>,
+    pub next_attempt_at: String,
+    pub scope: Option<serde_json::Value>,
+    pub result_id: Option<String>,
+    pub last_error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
