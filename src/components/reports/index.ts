@@ -1,4 +1,5 @@
 export { ReportsFullView } from './ReportsFullView';
+export { ReportDetailView } from './ReportDetailView';
 export { ReportsList } from './ReportsList';
 export { ReportRow } from './ReportRow';
 export { ScheduleStrip } from './ScheduleStrip';

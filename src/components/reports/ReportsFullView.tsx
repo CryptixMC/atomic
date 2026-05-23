@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { useReportsStore, Report } from '../../stores/reports';
+import { useUIStore } from '../../stores/ui';
 import { ReportsList } from './ReportsList';
 import { ReportEditorModal } from './ReportEditorModal';
 import { Modal } from '../ui/Modal';
@@ -20,6 +21,7 @@ export function ReportsFullView() {
   const reset = useReportsStore(s => s.reset);
   const setEnabled = useReportsStore(s => s.setEnabled);
   const deleteReport = useReportsStore(s => s.delete);
+  const openReportDetail = useUIStore(s => s.openReportDetail);
 
   const initializedRef = useRef(false);
   useEffect(() => {
@@ -98,7 +100,7 @@ export function ReportsFullView() {
         reports={reports}
         lastFindingByReport={lastFindingByReport}
         isLoading={isLoadingList}
-        onRowClick={openEdit}
+        onRowClick={openReportDetail}
         onEdit={openEdit}
         onToggleEnabled={setEnabled}
         onDelete={handleDelete}

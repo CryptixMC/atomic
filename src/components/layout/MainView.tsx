@@ -25,7 +25,7 @@ import { DashboardView } from '../dashboard/DashboardView';
 import { FAB } from '../ui/FAB';
 import { WikiFullView } from '../wiki/WikiFullView';
 import { WikiReader } from '../wiki/WikiReader';
-import { ReportsFullView } from '../reports';
+import { ReportsFullView, ReportDetailView } from '../reports';
 import { ChatViewer } from '../chat/ChatViewer';
 import { TabStrip } from './TabStrip';
 import { useAtomsStore } from '../../stores/atoms';
@@ -67,6 +67,7 @@ export function MainView() {
   const openReader = useUIStore(s => s.openReader);
   const readerState = useUIStore(s => s.readerState);
   const wikiReaderState = useUIStore(s => s.wikiReaderState);
+  const reportsDetailState = useUIStore(s => s.reportsDetailState);
   const localGraph = useUIStore(s => s.localGraph);
 
   const openSearchPalette = useUIStore(s => s.openSearchPalette);
@@ -431,6 +432,8 @@ export function MainView() {
             tagName={wikiReaderState.tagName}
             highlightText={wikiReaderState.highlightText}
           />
+        ) : reportsDetailState.reportId ? (
+          <ReportDetailView reportId={reportsDetailState.reportId} />
         ) : viewMode === 'dashboard' ? (
           <DashboardView />
         ) : viewMode === 'wiki' ? (

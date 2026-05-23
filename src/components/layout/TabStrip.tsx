@@ -15,9 +15,10 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { motion } from 'motion/react';
-import { ChevronLeft, ChevronRight, X, BookOpen, Network, FileText } from 'lucide-react';
+import { ChevronLeft, ChevronRight, X, BookOpen, Network, FileText, Telescope } from 'lucide-react';
 import { useUIStore, type Tab, type TabEntry } from '../../stores/ui';
 import { useAtomsStore } from '../../stores/atoms';
+import { useReportsStore } from '../../stores/reports';
 import { getTransport } from '../../lib/transport';
 
 const PILL_WIDTH = 156;
@@ -50,7 +51,7 @@ function fetchAtomTitle(atomId: string, onResolved: (title: string) => void): vo
     });
 }
 
-function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; icon: 'atom' | 'wiki' | 'graph' } {
+function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; icon: 'atom' | 'wiki' | 'graph' | 'report' } {
   const atomFromStore = useAtomsStore(
     useShallow((s) => {
       if (entry.type === 'atom' || entry.type === 'graph') {
@@ -58,6 +59,13 @@ function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; ic
       }
       return null;
     })
+  );
+
+  // Reports live in their own store; their name is the tab label and
+  // is cheap to read here (no extra fetch — reports are listed when
+  // the user enters the reports view, and the store keeps `byId`).
+  const reportName = useReportsStore(
+    useShallow((s) => (entry.type === 'report' ? s.byId[entry.reportId]?.name ?? null : null))
   );
 
   const [resolved, setResolved] = useState<string | null>(() => {
@@ -68,7 +76,7 @@ function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; ic
   });
 
   useEffect(() => {
-    if (entry.type === 'wiki') return;
+    if (entry.type === 'wiki' || entry.type === 'report') return;
     if (atomFromStore && atomFromStore.trim().length > 0) return;
     if (entry.title && entry.title.trim().length > 0) return;
     fetchAtomTitle(entry.atomId, (title) => setResolved(title));
@@ -76,6 +84,14 @@ function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; ic
 
   if (entry.type === 'wiki') {
     return { label: entry.tagName?.trim() || `Tab ${ordinal}`, icon: 'wiki' };
+  }
+
+  if (entry.type === 'report') {
+    const label =
+      (reportName && reportName.trim()) ||
+      (entry.title && entry.title.trim()) ||
+      `Report ${ordinal}`;
+    return { label, icon: 'report' };
   }
 
   const candidate =
@@ -106,7 +122,11 @@ function SortablePill({ tab, isActive, onSwitch, onClose, onBack, onForward, onM
   const canBack = tab.stackIndex > 0;
   const canForward = tab.stackIndex < tab.stack.length - 1;
 
-  const Icon = icon === 'wiki' ? BookOpen : icon === 'graph' ? Network : FileText;
+  const Icon =
+    icon === 'wiki' ? BookOpen :
+    icon === 'graph' ? Network :
+    icon === 'report' ? Telescope :
+    FileText;
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),

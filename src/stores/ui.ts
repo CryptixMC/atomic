@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { navigateTo } from '../router/navigate-ref';
-import { viewPath, atomReaderPath, wikiReaderPath, atomGraphPath } from '../router/routes';
+import { viewPath, atomReaderPath, wikiReaderPath, atomGraphPath, reportDetailPath } from '../router/routes';
 
 export type ViewMode = 'dashboard' | 'atoms' | 'canvas' | 'wiki' | 'reports';
 export type AtomsLayout = 'grid' | 'list';
@@ -32,6 +32,14 @@ interface WikiReaderState {
   highlightText: string | null;
 }
 
+interface ReportsDetailState {
+  /// The report whose detail view is currently active. `null` when no
+  /// report tab is the active tab. Projected from the active 'report'
+  /// TabEntry so existing component code can read a single field
+  /// rather than walking the tabs array.
+  reportId: string | null;
+}
+
 /// A single navigation entry within a tab's stack. Tabs hold the user's
 /// per-context history through atoms, wiki articles, and graphs.
 ///
@@ -43,7 +51,8 @@ interface WikiReaderState {
 export type TabEntry =
   | { type: 'atom'; atomId: string; tagId: string | null; highlightText: string | null; editing: boolean; title?: string }
   | { type: 'wiki'; tagId: string; tagName: string; highlightText: string | null }
-  | { type: 'graph'; atomId: string; tagId: string | null; title?: string };
+  | { type: 'graph'; atomId: string; tagId: string | null; title?: string }
+  | { type: 'report'; reportId: string; title?: string };
 
 export interface Tab {
   id: string;
@@ -72,6 +81,7 @@ interface UIStore {
   expandedTagIds: Record<string, boolean>;
   readerState: ReaderState;
   wikiReaderState: WikiReaderState;
+  reportsDetailState: ReportsDetailState;
   // Tabs model — the source of truth for "what's open and where in its
   // stack the user is". `readerState`/`wikiReaderState`/`localGraph` are
   // kept as synced projections of the active tab's current entry so that
@@ -128,6 +138,8 @@ interface UIStore {
   setReaderEditState: (editing: boolean, saveStatus?: 'idle' | 'saving' | 'saved' | 'error') => void;
   closeReader: () => void;
   openWikiReader: (tagId: string, tagName: string, highlightText?: string, opts?: { newTab?: boolean }) => void;
+  openReportDetail: (reportId: string, opts?: { newTab?: boolean; title?: string }) => void;
+  closeReportDetail: () => void;
   overlayNavigate: (entry: OverlayNavEntry, opts?: { newTab?: boolean }) => void;
   overlayBack: () => void;
   overlayForward: () => void;
@@ -178,12 +190,14 @@ function entriesEquivalent(a: TabEntry, b: TabEntry): boolean {
   if (a.type === 'atom' && b.type === 'atom') return a.atomId === b.atomId;
   if (a.type === 'wiki' && b.type === 'wiki') return a.tagId === b.tagId;
   if (a.type === 'graph' && b.type === 'graph') return a.atomId === b.atomId;
+  if (a.type === 'report' && b.type === 'report') return a.reportId === b.reportId;
   return false;
 }
 
 function entryUrl(entry: TabEntry): string {
   if (entry.type === 'atom') return atomReaderPath(entry.atomId, entry.tagId);
   if (entry.type === 'wiki') return wikiReaderPath(entry.tagId, entry.tagName);
+  if (entry.type === 'report') return reportDetailPath(entry.reportId);
   return atomGraphPath(entry.atomId, entry.tagId);
 }
 
@@ -192,12 +206,18 @@ function entryUrl(entry: TabEntry): string {
 function projectActiveEntry(entry: TabEntry | null): {
   readerState: ReaderState;
   wikiReaderState: WikiReaderState;
+  reportsDetailState: ReportsDetailState;
   localGraphPatch: Partial<LocalGraphState>;
 } {
+  const emptyReader: ReaderState = { atomId: null, highlightText: null, editing: false, saveStatus: 'idle' };
+  const emptyWiki: WikiReaderState = { tagId: null, tagName: null, highlightText: null };
+  const emptyReport: ReportsDetailState = { reportId: null };
+
   if (!entry) {
     return {
-      readerState: { atomId: null, highlightText: null, editing: false, saveStatus: 'idle' },
-      wikiReaderState: { tagId: null, tagName: null, highlightText: null },
+      readerState: emptyReader,
+      wikiReaderState: emptyWiki,
+      reportsDetailState: emptyReport,
       localGraphPatch: { isOpen: false, centerAtomId: null, navigationHistory: [] },
     };
   }
@@ -209,20 +229,31 @@ function projectActiveEntry(entry: TabEntry | null): {
         editing: entry.editing,
         saveStatus: 'idle',
       },
-      wikiReaderState: { tagId: null, tagName: null, highlightText: null },
+      wikiReaderState: emptyWiki,
+      reportsDetailState: emptyReport,
       localGraphPatch: { isOpen: false },
     };
   }
   if (entry.type === 'wiki') {
     return {
-      readerState: { atomId: null, highlightText: null, editing: false, saveStatus: 'idle' },
+      readerState: emptyReader,
       wikiReaderState: { tagId: entry.tagId, tagName: entry.tagName, highlightText: entry.highlightText },
+      reportsDetailState: emptyReport,
+      localGraphPatch: { isOpen: false },
+    };
+  }
+  if (entry.type === 'report') {
+    return {
+      readerState: emptyReader,
+      wikiReaderState: emptyWiki,
+      reportsDetailState: { reportId: entry.reportId },
       localGraphPatch: { isOpen: false },
     };
   }
   return {
-    readerState: { atomId: null, highlightText: null, editing: false, saveStatus: 'idle' },
-    wikiReaderState: { tagId: null, tagName: null, highlightText: null },
+    readerState: emptyReader,
+    wikiReaderState: emptyWiki,
+    reportsDetailState: emptyReport,
     localGraphPatch: {
       isOpen: true,
       centerAtomId: entry.atomId,
@@ -246,6 +277,9 @@ export const useUIStore = create<UIStore>()(
         tagId: null,
         tagName: null,
         highlightText: null,
+      },
+      reportsDetailState: {
+        reportId: null,
       },
       tabs: [],
       activeTabId: null,
@@ -595,6 +629,24 @@ export const useUIStore = create<UIStore>()(
           },
           opts,
         );
+      },
+
+      openReportDetail: (reportId, opts) => {
+        get().openEntry(
+          {
+            type: 'report',
+            reportId,
+            title: opts?.title,
+          },
+          { newTab: opts?.newTab },
+        );
+      },
+
+      closeReportDetail: () => {
+        const state = get();
+        if (state.activeTabId) {
+          state.closeTab(state.activeTabId);
+        }
       },
 
       overlayNavigate: (entry, opts) => {

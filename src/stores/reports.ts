@@ -200,6 +200,13 @@ interface ReportsStore {
   fetchAll: () => Promise<void>;
   fetchLastFinding: (reportId: string) => Promise<void>;
 
+  /// Fetch a single report by id and merge it into the store. Used by
+  /// the detail view on cold-start deep links when the list hasn't
+  /// been hydrated yet — calling `fetchAll` would work but is wasteful
+  /// for the "open one report directly" path. Returns the report on
+  /// success, `null` if the server returned 404 (report deleted).
+  fetchOne: (reportId: string) => Promise<Report | null>;
+
   /// Create a new report. Returns the created `Report` so the caller
   /// (typically the editor modal) can navigate to it on success.
   /// Throws on failure with a useful message; the store toasts and the
@@ -274,6 +281,32 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
         const msg = e instanceof Error ? e.message : String(e);
         set({ isLoadingList: false, loadError: msg });
         toast.error('Failed to load reports', { description: msg });
+      }
+    },
+
+    fetchOne: async (reportId: string) => {
+      try {
+        const report = await getTransport().invoke<Report>('get_report', { report_id: reportId });
+        set(state => ({
+          // Prepend if not already present, otherwise replace in place.
+          // Either way the byId map is the source of truth for the
+          // detail view.
+          reports: state.byId[reportId]
+            ? state.reports.map(r => (r.id === reportId ? report : r))
+            : [report, ...state.reports],
+          byId: { ...state.byId, [reportId]: report },
+        }));
+        return report;
+      } catch (e) {
+        // 404 means the report was deleted; the caller (detail view)
+        // surfaces this with a toast and navigates back. Other errors
+        // toast directly so they're visible.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/not found|404/i.test(msg)) {
+          return null;
+        }
+        toast.error('Failed to load report', { description: msg });
+        return null;
       }
     },
 
