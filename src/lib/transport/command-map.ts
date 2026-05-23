@@ -252,6 +252,10 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
   // Reports replaced the legacy briefing path in phase 3. Findings are
   // first-class atoms; their listing is the dashboard widget's data
   // source via `list_findings_for_report`.
+  list_reports: {
+    method: 'GET',
+    path: '/api/reports',
+  },
   list_findings_for_report: {
     method: 'GET',
     path: (a) => {

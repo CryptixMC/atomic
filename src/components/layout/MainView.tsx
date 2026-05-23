@@ -11,6 +11,7 @@ import {
   BookOpen,
   Search,
   Filter,
+  Telescope,
 } from 'lucide-react';
 import { motion, LayoutGroup } from 'motion/react';
 import { AtomGrid } from '../atoms/AtomGrid';
@@ -24,6 +25,7 @@ import { DashboardView } from '../dashboard/DashboardView';
 import { FAB } from '../ui/FAB';
 import { WikiFullView } from '../wiki/WikiFullView';
 import { WikiReader } from '../wiki/WikiReader';
+import { ReportsFullView } from '../reports';
 import { ChatViewer } from '../chat/ChatViewer';
 import { TabStrip } from './TabStrip';
 import { useAtomsStore } from '../../stores/atoms';
@@ -266,6 +268,7 @@ export function MainView() {
                 ['atoms', Library, 'Atoms'],
                 ['canvas', Network, 'Canvas view'],
                 ['wiki', BookOpen, 'Wiki view'],
+                ['reports', Telescope, 'Reports'],
               ] as const).map(([mode, IconCmp, label]) => {
                 const isActiveNav = onBaseView && viewMode === mode;
                 return (
@@ -432,6 +435,8 @@ export function MainView() {
           <DashboardView />
         ) : viewMode === 'wiki' ? (
           <WikiFullView />
+        ) : viewMode === 'reports' ? (
+          <ReportsFullView />
         ) : viewMode === 'canvas' ? (
           <SigmaCanvas />
         ) : atomsLayout === 'grid' ? (
