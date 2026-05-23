@@ -419,29 +419,59 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
         // extra fetch. If the report id is null (orphaned finding —
         // report deleted, FK SET NULL), skip the cache merge; the
         // FindingReader still renders from the returned payload.
+        //
+        // Critically: if the cache already holds a row with the same
+        // atom updated_at + finding shape, we skip the write
+        // entirely. fetchFinding is called from FindingReader's mount
+        // effect; if every call produced a new array reference, every
+        // downstream selector that walks findingsByReport would
+        // re-emit, including the one FindingReader itself uses for
+        // display fallbacks. That was harmless after we removed it
+        // from the effect's deps, but a no-write fast path also
+        // saves an unnecessary set() round-trip.
         if (finding.report_id) {
           const reportId = finding.report_id;
           set(state => {
             const existing = state.findingsByReport[reportId] ?? [];
-            const alreadyPresent = existing.some(f => f.atom.id === atomId);
-            const merged = alreadyPresent
+            const current = existing.find(f => f.atom.id === atomId);
+            const isCurrent =
+              current !== undefined &&
+              current.atom.updated_at === atom.updated_at &&
+              current.finding.run_id === finding.run_id &&
+              current.finding.report_name_snapshot === finding.report_name_snapshot;
+
+            const nextCitationCount =
+              state.citationCountsByAtomId[atomId] === citations.length
+                ? state.citationCountsByAtomId
+                : { ...state.citationCountsByAtomId, [atomId]: citations.length };
+
+            if (isCurrent) {
+              // Cache already current — leave findingsByReport alone
+              // so referential equality holds and downstream
+              // subscribers don't re-emit.
+              return nextCitationCount === state.citationCountsByAtomId
+                ? state
+                : { citationCountsByAtomId: nextCitationCount };
+            }
+
+            const merged = current
               ? existing.map(f => (f.atom.id === atomId ? { finding, atom } : f))
               : [{ finding, atom }, ...existing];
             return {
               findingsByReport: { ...state.findingsByReport, [reportId]: merged },
+              citationCountsByAtomId: nextCitationCount,
+            };
+          });
+        } else {
+          set(state => {
+            if (state.citationCountsByAtomId[atomId] === citations.length) return state;
+            return {
               citationCountsByAtomId: {
                 ...state.citationCountsByAtomId,
                 [atomId]: citations.length,
               },
             };
           });
-        } else {
-          set(state => ({
-            citationCountsByAtomId: {
-              ...state.citationCountsByAtomId,
-              [atomId]: citations.length,
-            },
-          }));
         }
 
         return { atom, finding, citations };

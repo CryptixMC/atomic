@@ -63,59 +63,54 @@ export function FindingReader({ atomId }: FindingReaderProps) {
     { top: number; left: number; bottom: number; width: number } | null
   >(null);
 
-  // Resolve the finding payload. Three branches:
-  //   - We've already loaded it locally (state) — render.
-  //   - The cache has the atom+provenance row — fetch only citations.
-  //   - Cold path — fetch everything via `fetchFinding`.
+  // Resolve the finding payload. Only re-runs on atomId change —
+  // critically NOT on cachedFinding changes. fetchFinding's
+  // side-effect cache merge (which writes into findingsByReport) used
+  // to retrigger this effect via the cachedFinding selector, creating
+  // an infinite loop that manifested as perpetual loading. Reading the
+  // cache once via getState() inside the effect captures the snapshot
+  // we need without subscribing to its updates.
   useEffect(() => {
     let cancelled = false;
 
-    async function load() {
-      // Cache hit: we already have atom + provenance. Just need
-      // citations (the cache stores them as a count but not the rows).
-      if (cachedFinding) {
-        setIsLoading(true);
-        try {
-          // Walk the same network path fetchFinding uses for citations
-          // only — slightly cheaper than the full triple-fetch when
-          // most of the data is already in memory.
-          const result = await fetchFinding(atomId);
-          if (cancelled) return;
-          setLoaded(result);
-        } finally {
-          if (!cancelled) setIsLoading(false);
-        }
-        return;
-      }
-
-      // Cold path. fetchFinding pulls the atom, provenance, and
-      // citations in parallel and merges into the cache.
-      setIsLoading(true);
-      try {
-        const result = await fetchFinding(atomId);
-        if (cancelled) return;
-        if (!result) {
-          toast.error('Finding unavailable', {
-            description: 'This atom is no longer a finding, or was deleted.',
-          });
-          closeFindingReader();
-          return;
-        }
-        setLoaded(result);
-        // Prime the report row so the breadcrumb's "From: <Report
-        // Name>" link has a name to render right away. fetchOne is
-        // idempotent if the row is already cached.
-        if (result.finding.report_id) {
-          void fetchOne(result.finding.report_id);
-        }
-      } finally {
-        if (!cancelled) setIsLoading(false);
+    // Seed `loaded` synchronously from the cache so a render between
+    // mount and fetch-resolve has prose to show instead of the
+    // skeleton. We still fetch — the cache stores atom+provenance but
+    // not the citation rows, and the agent's [N] markers need
+    // citations to resolve.
+    const store = useReportsStore.getState();
+    let seed: LoadedFinding | null = null;
+    for (const findings of Object.values(store.findingsByReport)) {
+      const match = findings.find((f) => f.atom.id === atomId);
+      if (match) {
+        seed = { atom: match.atom, finding: match.finding, citations: [] };
+        break;
       }
     }
+    setLoaded(seed);
+    setIsLoading(true);
 
-    void load();
+    fetchFinding(atomId).then((result) => {
+      if (cancelled) return;
+      setIsLoading(false);
+      if (!result) {
+        toast.error('Finding unavailable', {
+          description: 'This atom is no longer a finding, or was deleted.',
+        });
+        closeFindingReader();
+        return;
+      }
+      setLoaded(result);
+      // Prime the report row so the breadcrumb's "From: <Report Name>"
+      // link has a name to render right away. fetchOne is idempotent
+      // if the row is already cached.
+      if (result.finding.report_id) {
+        void fetchOne(result.finding.report_id);
+      }
+    });
+
     return () => { cancelled = true; };
-  }, [atomId, cachedFinding, fetchFinding, fetchOne, closeFindingReader]);
+  }, [atomId, fetchFinding, fetchOne, closeFindingReader]);
 
   const displayedName = loaded
     ? (reportName ?? loaded.finding.report_name_snapshot ?? 'Report')
