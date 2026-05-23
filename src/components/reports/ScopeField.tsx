@@ -119,6 +119,7 @@ export const ScopeField = memo(function ScopeField({
         <TagSelector
           selectedTags={selectedTags}
           onTagsChange={(next) => onChange(next.map(t => t.id), window)}
+          excludeAutotagTargets
         />
       </div>
 

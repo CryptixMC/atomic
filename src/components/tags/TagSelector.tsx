@@ -8,6 +8,15 @@ import { Tag } from '../../stores/atoms';
 interface TagSelectorProps {
   selectedTags: Tag[];
   onTagsChange: (tags: Tag[]) => void;
+  /// When true, omit tags marked `is_autotag_target` from the search
+  /// results in the finder. These are conceptual category buckets
+  /// (Topics, People, Locations, etc.) that the auto-tagger uses to
+  /// place children — they aren't meaningful tag assignments
+  /// themselves. The report editor enables this for scope and
+  /// output-tag pickers; the atom-reader's tag editor leaves it off
+  /// because power users might still want to apply category tags
+  /// manually in that context.
+  excludeAutotagTargets?: boolean;
 }
 
 // Fuzzy match result with score and match indices
@@ -95,7 +104,11 @@ function HighlightedText({ text, matchIndices }: { text: string; matchIndices: n
   return <>{parts}</>;
 }
 
-export function TagSelector({ selectedTags, onTagsChange }: TagSelectorProps) {
+export function TagSelector({
+  selectedTags,
+  onTagsChange,
+  excludeAutotagTargets = false,
+}: TagSelectorProps) {
   const tags = useTagsStore(s => s.tags);
   const createTag = useTagsStore(s => s.createTag);
   const [inputValue, setInputValue] = useState('');
@@ -108,15 +121,21 @@ export function TagSelector({ selectedTags, onTagsChange }: TagSelectorProps) {
     : selectedTags.slice(0, MAX_VISIBLE_TAGS);
   const hiddenSelectedCount = selectedTags.length - MAX_VISIBLE_TAGS;
 
-  // Flatten the tag tree for searching
+  // Flatten the tag tree for searching. When `excludeAutotagTargets`
+  // is set, drop the autotag-category buckets from the searchable
+  // list while still descending into their children — a finder
+  // request for "Topics" returns nothing; "AI" under Topics still
+  // shows up normally.
   const flattenTags = (tags: TagWithCount[]): Tag[] => {
     return tags.reduce<Tag[]>((acc, tag) => {
-      acc.push({
-        id: tag.id,
-        name: tag.name,
-        parent_id: tag.parent_id,
-        created_at: tag.created_at,
-      });
+      if (!excludeAutotagTargets || !tag.is_autotag_target) {
+        acc.push({
+          id: tag.id,
+          name: tag.name,
+          parent_id: tag.parent_id,
+          created_at: tag.created_at,
+        });
+      }
       if (tag.children) {
         acc.push(...flattenTags(tag.children));
       }

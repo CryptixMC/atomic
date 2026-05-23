@@ -446,6 +446,7 @@ export function ReportEditorModal({ isOpen, report, initialBody, onClose, onSave
               <TagSelector
                 selectedTags={outputTagObjs}
                 onTagsChange={(next) => setForm(f => ({ ...f, output_atom_tags: next.map(t => t.id) }))}
+                excludeAutotagTargets
               />
             </div>
           </div>
