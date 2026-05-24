@@ -121,17 +121,23 @@ impl AtomicCore {
             }
 
             let page = self
-                .list_atoms(&ListAtomsParams {
-                    tag_id: None,
-                    limit: 250,
-                    offset: 0,
-                    cursor,
-                    cursor_id,
-                    source_filter: SourceFilter::All,
-                    source_value: None,
-                    sort_by: SortField::Created,
-                    sort_order: SortOrder::Asc,
-                })
+                .list_atoms(
+                    &ListAtomsParams {
+                        tag_id: None,
+                        limit: 250,
+                        offset: 0,
+                        cursor,
+                        cursor_id,
+                        source_filter: SourceFilter::All,
+                        source_value: None,
+                        sort_by: SortField::Created,
+                        sort_order: SortOrder::Asc,
+                    },
+                    // Export everything the user has — captured notes plus
+                    // any agent-emitted findings — so a full export is a
+                    // faithful snapshot of what's in the DB.
+                    &crate::models::KindFilter::All,
+                )
                 .await?;
 
             if page.atoms.is_empty() {

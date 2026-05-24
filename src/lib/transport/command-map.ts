@@ -248,39 +248,75 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     path: '/api/embeddings/status/all',
   },
 
-  // ==================== Briefings ====================
-  get_latest_briefing: {
+  // ==================== Reports ====================
+  // Reports replaced the legacy briefing path in phase 3. Findings are
+  // first-class atoms; their listing is the dashboard widget's data
+  // source via `list_findings_for_report`.
+  list_reports: {
     method: 'GET',
-    path: '/api/briefings/latest',
+    path: '/api/reports',
   },
-  list_briefings: {
+  get_report: {
     method: 'GET',
-    path: (a) => {
-      const params = new URLSearchParams();
-      if (a.limit != null) params.set('limit', String(a.limit));
-      return `/api/briefings${params.toString() ? `?${params}` : ''}`;
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}`,
+  },
+  create_report: {
+    method: 'POST',
+    path: '/api/reports',
+    argsMode: 'body',
+    // Caller passes the CreateReportRequest shape directly. Serde
+    // derives accept the exact snake_case keys we use in TS, so the
+    // body is the args object verbatim.
+  },
+  update_report: {
+    method: 'PUT',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}`,
+    argsMode: 'body',
+    // The PUT body is just the UpdateReportRequest object. We strip the
+    // report_id key because it lives in the path, not the body.
+    transformArgs: (a) => {
+      const { report_id: _omit, ...rest } = a;
+      return rest;
     },
   },
-  get_briefing: {
-    method: 'GET',
-    path: (a) => `/api/briefings/${encodeURIComponent(a.id as string)}`,
+  delete_report: {
+    method: 'DELETE',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}`,
   },
-  run_briefing_now: {
+  list_findings_for_report: {
+    method: 'GET',
+    path: (a) => {
+      const id = encodeURIComponent(a.report_id as string);
+      const params = new URLSearchParams();
+      if (a.limit != null) params.set('limit', String(a.limit));
+      return `/api/reports/${id}/findings${
+        params.toString() ? `?${params}` : ''
+      }`;
+    },
+  },
+  list_finding_citations: {
+    method: 'GET',
+    path: (a) =>
+      `/api/findings/${encodeURIComponent(a.atom_id as string)}/citations`,
+  },
+  get_finding_provenance: {
+    method: 'GET',
+    path: (a) => `/api/findings/${encodeURIComponent(a.atom_id as string)}`,
+  },
+  run_report_now: {
     method: 'POST',
-    path: '/api/briefings/run',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}/run`,
   },
-  get_briefing_schedule: {
+  get_featured_report_id: {
     method: 'GET',
-    path: '/api/briefings/schedule',
+    path: '/api/dashboard/featured-report',
   },
-  set_briefing_schedule: {
+  set_featured_report_id: {
     method: 'PUT',
-    path: '/api/briefings/schedule',
+    path: '/api/dashboard/featured-report',
     argsMode: 'body',
     transformArgs: (a) => ({
-      frequency: a.frequency,
-      time: a.time,
-      weekday: a.weekday ?? null,
+      report_id: a.report_id ?? null,
     }),
   },
 

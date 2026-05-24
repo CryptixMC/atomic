@@ -79,7 +79,13 @@ pub trait AtomStore: Send + Sync {
     async fn delete_atom(&self, id: &str) -> StorageResult<()>;
 
     /// Get all atoms with a specific tag (including descendants of that tag).
-    async fn get_atoms_by_tag(&self, tag_id: &str) -> StorageResult<Vec<AtomWithTags>>;
+    /// `kinds` restricts which atom kinds are included — see
+    /// [`crate::models::KindFilter`].
+    async fn get_atoms_by_tag(
+        &self,
+        tag_id: &str,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithTags>>;
 
     /// Get materialized markdown wiki-links emitted by a source atom.
     async fn get_atom_links(&self, atom_id: &str) -> StorageResult<Vec<AtomLink>>;
@@ -91,8 +97,13 @@ pub trait AtomStore: Send + Sync {
         limit: i32,
     ) -> StorageResult<Vec<AtomLinkSuggestion>>;
 
-    /// List atoms with pagination, filtering, and sorting.
-    async fn list_atoms(&self, params: &ListAtomsParams) -> StorageResult<PaginatedAtoms>;
+    /// List atoms with pagination, filtering, and sorting. `kinds` restricts
+    /// which atom kinds appear in the results and the total count.
+    async fn list_atoms(
+        &self,
+        params: &ListAtomsParams,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<PaginatedAtoms>;
 
     /// Get all unique sources with atom counts.
     async fn get_source_list(&self) -> StorageResult<Vec<SourceInfo>>;
@@ -109,8 +120,12 @@ pub trait AtomStore: Send + Sync {
     /// Save atom canvas positions (replaces all).
     async fn save_atom_positions(&self, positions: &[AtomPosition]) -> StorageResult<()>;
 
-    /// Get all atoms with their average embedding vectors.
-    async fn get_atoms_with_embeddings(&self) -> StorageResult<Vec<AtomWithEmbedding>>;
+    /// Get all atoms with their average embedding vectors. `kinds` restricts
+    /// which atom kinds are included.
+    async fn get_atoms_with_embeddings(
+        &self,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithEmbedding>>;
 
     /// Get just the tag IDs for an atom (lightweight, no full atom fetch).
     async fn get_atom_tag_ids(&self, atom_id: &str) -> StorageResult<Vec<String>>;
@@ -171,7 +186,41 @@ pub trait AtomStore: Send + Sync {
     /// Lightweight canvas metadata: (atom_id, title, primary_tag_name, tag_count, source_url).
     async fn get_canvas_atom_metadata_light(
         &self,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<(String, String, Option<String>, i32, Option<String>)>>;
+
+    /// Resolve the source-scope atom set for a report run in one query.
+    ///
+    /// - `tag_ids` empty: no tag filter (every atom in the per-DB store).
+    /// - `tag_ids` non-empty: recursive subtree expansion so a top-level
+    ///   tag implicitly includes its descendants.
+    /// - `since` `Some`: filter `atoms.created_at > since`. None = no time
+    ///   bound. Caller pre-resolves "since_last_run" and ISO-8601
+    ///   durations into an RFC3339 timestamp.
+    /// - `kinds`: standard kind filter (same `Only(vec![Captured])`
+    ///   default as every other context-assembly query).
+    /// - `limit`: optional cap. None = unlimited; pre-cap counts are
+    ///   reported separately via [`count_atoms_for_report_scope`].
+    ///
+    /// Returns newest-first, joined with tag rows so the agent prompt has
+    /// the same shape as the daily briefing today.
+    async fn list_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>>;
+
+    /// Pre-cap count for the same scope query used by
+    /// [`list_atoms_for_report_scope`]. Reported back to the agent so it
+    /// knows whether the visible list is truncated.
+    async fn count_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32>;
 }
 
 // ==================== Tag Storage ====================
@@ -252,7 +301,11 @@ pub trait TagStore: Send + Sync {
     async fn get_tag_hierarchy(&self, tag_id: &str) -> StorageResult<Vec<String>>;
 
     /// Count distinct atoms that have any of the given tags.
-    async fn count_atoms_with_tags(&self, tag_ids: &[String]) -> StorageResult<i32>;
+    async fn count_atoms_with_tags(
+        &self,
+        tag_ids: &[String],
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32>;
 }
 
 // ==================== Chunk/Embedding Storage ====================
@@ -506,7 +559,9 @@ pub trait ChunkStore: Send + Sync {
 pub trait SearchStore: Send + Sync {
     /// Perform vector similarity search using embeddings.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
-    /// this timestamp are returned.
+    /// this timestamp are returned. `kinds` is non-defaulted so every caller
+    /// declares whether finding atoms are in scope (the UI path passes
+    /// `KindFilter::All`; external tools opt in to `KindFilter::only(Captured)`).
     async fn vector_search(
         &self,
         query_embedding: &[f32],
@@ -514,17 +569,20 @@ pub trait SearchStore: Send + Sync {
         threshold: f32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
 
     /// Perform keyword search using full-text search.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
-    /// this timestamp are returned.
+    /// this timestamp are returned. `kinds` controls the atom-kind filter; see
+    /// `vector_search` for the discipline.
     async fn keyword_search(
         &self,
         query: &str,
         limit: i32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
 
     /// Find atoms similar to a given atom.
@@ -543,6 +601,7 @@ pub trait SearchStore: Send + Sync {
         limit: i32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
 
     /// Search for chunks using vector similarity.
@@ -554,6 +613,7 @@ pub trait SearchStore: Send + Sync {
         threshold: f32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
 }
 
@@ -734,47 +794,6 @@ pub trait WikiStore: Send + Sync {
         tag_id: &str,
         max_current_count: Option<i32>,
     ) -> StorageResult<bool>;
-}
-
-// ==================== Briefing Storage ====================
-
-/// Storage operations for daily briefings (the scheduled-task briefing feature).
-#[async_trait]
-pub trait BriefingStore: Send + Sync {
-    /// Fetch up to `limit` atoms with `created_at > since`, newest first.
-    async fn list_new_atoms_since(
-        &self,
-        since: &str,
-        limit: i32,
-    ) -> StorageResult<Vec<AtomWithTags>>;
-
-    /// Count atoms with `created_at > since`.
-    async fn count_new_atoms_since(&self, since: &str) -> StorageResult<i32>;
-
-    /// Insert a new briefing plus its citations. Returns the briefing joined
-    /// with citations (citations have `source_url` populated via JOIN).
-    async fn insert_briefing(
-        &self,
-        briefing: &crate::briefing::Briefing,
-        citations: &[crate::briefing::BriefingCitation],
-    ) -> StorageResult<crate::briefing::BriefingWithCitations>;
-
-    /// Fetch the most recent briefing (joined with citations).
-    async fn get_latest_briefing(
-        &self,
-    ) -> StorageResult<Option<crate::briefing::BriefingWithCitations>>;
-
-    /// Fetch a specific briefing by id (joined with citations).
-    async fn get_briefing(
-        &self,
-        id: &str,
-    ) -> StorageResult<Option<crate::briefing::BriefingWithCitations>>;
-
-    /// List recent briefings (without citations) for a lightweight history view.
-    async fn list_briefings(&self, limit: i32) -> StorageResult<Vec<crate::briefing::Briefing>>;
-
-    /// Delete a briefing by id. Briefing citations cascade.
-    async fn delete_briefing(&self, id: &str) -> StorageResult<()>;
 }
 
 // ==================== Feed Storage ====================
@@ -961,6 +980,261 @@ pub trait DatabaseStore: Send + Sync {
     async fn purge_database_data(&self, db_id: &str) -> StorageResult<()>;
 }
 
+// ==================== Task Run Storage ====================
+
+/// Storage operations for the `task_runs` execution ledger.
+///
+/// The scheduler ledger (`scheduler::ledger`) composes these into a state
+/// machine; the trait itself is intentionally CRUD-shaped with the
+/// conditional-update predicate baked into each writer so the contention
+/// semantics live in SQL, not in Rust. See `docs/plans/reports.md`
+/// §"Execution ledger — task_runs" for the contract.
+#[async_trait]
+pub trait TaskRunStore: Send + Sync {
+    /// Insert a fresh run row (state is whatever the caller passes — typically
+    /// `pending`). The caller owns id and all timestamps.
+    async fn insert_task_run(&self, run: &crate::models::TaskRun) -> StorageResult<()>;
+
+    /// Best-effort variant of [`Self::insert_task_run`]. Returns `false`
+    /// when the `idx_task_runs_active_unique` partial index rejected the
+    /// insert (another worker already created an active row for this
+    /// task/subject). Used by `claim_or_create` to close the race window
+    /// between `find_active_task_run` and the actual insert: without this
+    /// check, two concurrent claimers can both observe "no active row"
+    /// and insert distinct rows that each get claimed, executing the
+    /// same report twice.
+    async fn try_insert_task_run(&self, run: &crate::models::TaskRun) -> StorageResult<bool>;
+
+    /// Read a single row by id.
+    async fn get_task_run(&self, id: &str) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Find the next-runnable row for `(task_id, subject_id)`: either a
+    /// `pending` row whose `next_attempt_at <= now`, or a `running` row whose
+    /// `lease_until < now` (crash-recovery candidate). Returns the row with
+    /// the earliest `next_attempt_at` first.
+    async fn find_runnable_task_run(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+        now: &str,
+    ) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Find any non-terminal row for `(task_id, subject_id)` regardless of
+    /// timing — i.e., pending OR running, with `next_attempt_at` and
+    /// `lease_until` ignored. The intended caller is `claim_or_create`: if
+    /// a non-runnable active row exists (e.g., running with a live lease, or
+    /// pending with `next_attempt_at` in the future), inserting a fresh
+    /// pending row would race past it and start a duplicate execution.
+    /// Most-recent first.
+    async fn find_active_task_run(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+    ) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Conditional `pending → running` transition. Returns `true` iff this
+    /// caller won the claim (predicate `id = ? AND state = 'pending'` held).
+    /// On success, sets `started_at`, `lease_until`, `updated_at`, and bumps
+    /// `attempts` by 1.
+    async fn claim_pending_task_run(
+        &self,
+        id: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> StorageResult<bool>;
+
+    /// Conditional crash-recovery reclaim. Predicate is
+    /// `id = ? AND state = 'running' AND lease_until < ?`. On success, sets a
+    /// fresh `lease_until` and `started_at`, leaves `attempts` untouched
+    /// (we don't punish a process crash as a logic failure).
+    async fn reclaim_expired_task_run(
+        &self,
+        id: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> StorageResult<bool>;
+
+    /// Conditional lease refresh used by the heartbeat task. Predicate is
+    /// `id = ? AND state = 'running' AND lease_until = expected_lease` —
+    /// the extra lease fence protects a slow worker against a peer that
+    /// reclaimed the row after the worker's lease expired (the peer would
+    /// have replaced our `lease_until` value, so our refresh no longer
+    /// matches). Returns `false` when the row has moved on (terminal state,
+    /// or reclaimed by another worker).
+    async fn heartbeat_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        new_lease_until: &str,
+    ) -> StorageResult<bool>;
+
+    /// Terminal `running → succeeded`. Predicate is
+    /// `id = ? AND state = 'running' AND lease_until = expected_lease` so a
+    /// stale worker whose lease was already reclaimed by a peer can't
+    /// double-complete a run that's been re-attempted underneath it.
+    async fn complete_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        result_id: Option<&str>,
+        finished_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// `running → pending` with `next_attempt_at` set in the future and the
+    /// stored `attempts` left at the current value (the claim already
+    /// incremented it). Clears `lease_until`. Same fenced predicate as
+    /// `complete_task_run`.
+    async fn fail_task_run_retry(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        now: &str,
+        next_attempt_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// Terminal `running → abandoned`. Same fenced predicate as the other
+    /// terminal writers.
+    async fn fail_task_run_abandon(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        finished_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// Most-recent-first run history for a task. `subject_id = None` matches
+    /// any subject_id (history-by-task); `Some(...)` filters to that subject.
+    async fn list_recent_task_runs(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+        limit: i32,
+    ) -> StorageResult<Vec<crate::models::TaskRun>>;
+}
+
+// ==================== Reports ====================
+
+/// Storage operations for reports, finding provenance, and citations.
+///
+/// CRUD on the definitions, plus the transactional finding-write helper
+/// that wraps the atom + provenance + citation rows in a single commit.
+/// `update_report_cache` is the fast-path writer for the advisory cache
+/// fields (`last_run_at`, `last_finding_atom_id`, `last_error`); the
+/// authoritative state lives on `task_runs` and `report_findings`.
+#[async_trait]
+pub trait ReportStore: Send + Sync {
+    /// List every report definition, most-recently-updated first.
+    async fn list_reports(&self) -> StorageResult<Vec<crate::models::Report>>;
+
+    /// List enabled reports only. Fast path for the scheduler tick.
+    async fn list_enabled_reports(&self) -> StorageResult<Vec<crate::models::Report>>;
+
+    async fn get_report(&self, id: &str) -> StorageResult<Option<crate::models::Report>>;
+
+    /// Insert a fresh report. The storage layer generates `id`, timestamps,
+    /// and the cache columns; the request carries everything else.
+    async fn insert_report(
+        &self,
+        request: &crate::models::CreateReportRequest,
+    ) -> StorageResult<crate::models::Report>;
+
+    /// Partial-update by id. Only `Some` fields are written.
+    async fn update_report(
+        &self,
+        id: &str,
+        request: &crate::models::UpdateReportRequest,
+    ) -> StorageResult<crate::models::Report>;
+
+    async fn set_report_enabled(&self, id: &str, enabled: bool) -> StorageResult<()>;
+
+    async fn delete_report(&self, id: &str) -> StorageResult<()>;
+
+    /// Write the cache columns (`last_run_at`, `last_finding_atom_id`,
+    /// `last_error`) after a run terminates. Optional fields lets callers
+    /// pass `None` for "leave previous value" or explicit `Some(None)` for
+    /// "clear" — encoded as `Option<Option<...>>` everywhere except where
+    /// "leave unchanged" is the only sensible no-op (every cache column).
+    ///
+    /// `last_run_at = None` leaves the column untouched. This is the path
+    /// taken by failure stamping: a first-run failure must not write an
+    /// empty string into `last_run_at` (which would round-trip back as
+    /// `Some("")` and then fail RFC3339 parsing in `schedule::is_due`,
+    /// effectively wedging the report).
+    async fn update_report_cache(
+        &self,
+        id: &str,
+        last_run_at: Option<&str>,
+        last_finding_atom_id: Option<Option<&str>>,
+        last_error: Option<Option<&str>>,
+    ) -> StorageResult<()>;
+
+    /// Most-recent-first list of provenance rows for a report, joined with
+    /// the finding atom so the dashboard history view can render snippets.
+    async fn list_findings_for_report(
+        &self,
+        report_id: &str,
+        limit: i32,
+    ) -> StorageResult<Vec<(crate::models::ReportFinding, crate::models::AtomWithTags)>>;
+
+    /// Lookup the provenance row for a finding atom. None if the atom is
+    /// either not a finding or its provenance row was removed.
+    async fn get_finding_provenance(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Option<crate::models::ReportFinding>>;
+
+    /// Set of finding atom ids previously produced by `report_id`. Used by
+    /// the agent loop to exclude a report's own prior output from its
+    /// semantic_search results.
+    async fn list_finding_atom_ids_for_report(&self, report_id: &str)
+        -> StorageResult<Vec<String>>;
+
+    /// Every citation row for a finding atom, ordered by `position` ASC so
+    /// the markdown renderer's `[N]` lookup is a direct index. Returns
+    /// empty when the atom isn't a finding (or has no citations).
+    async fn list_citations_for_finding(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Vec<crate::models::ReportFindingCitation>>;
+
+    /// One-shot transactional write of the finding atom, its tags, its
+    /// provenance row, and all citation rows. On any error the entire
+    /// commit is rolled back so a partial write cannot orphan a finding
+    /// atom without its provenance.
+    async fn write_finding_transactionally(
+        &self,
+        atom_request: &crate::CreateAtomRequest,
+        atom_id: &str,
+        atom_created_at: &str,
+        provenance: &crate::models::ReportFinding,
+        citations: &[crate::models::ReportFindingCitation],
+    ) -> StorageResult<crate::models::AtomWithTags>;
+}
+
+/// Minimal raw-access surface kept alive solely so the phase-3 briefings →
+/// finding-atoms migration can read the legacy `briefings` /
+/// `briefing_citations` tables and drop them afterwards.
+///
+/// The full `BriefingStore` was retired in phase 3; everything user-facing
+/// moved onto the reports primitive. These two methods are the only
+/// remaining touchpoints, kept on the supertrait so the migration can run
+/// on any DB an older deployment is upgraded from.
+#[async_trait]
+pub trait LegacyBriefingsMigrationStore: Send + Sync {
+    /// Stream every legacy briefing row joined with its citation rows in a
+    /// deterministic order (briefing.created_at ASC, citation.citation_index
+    /// ASC). Returns an empty Vec if the tables have already been dropped.
+    async fn fetch_legacy_briefings(
+        &self,
+    ) -> StorageResult<Vec<crate::reports::seed::LegacyBriefingRow>>;
+
+    /// Drop the `briefings` and `briefing_citations` tables. Idempotent —
+    /// `DROP TABLE IF EXISTS` semantics so a re-run after a successful
+    /// migration is a no-op.
+    async fn drop_legacy_briefing_tables(&self) -> StorageResult<()>;
+}
+
 // ==================== Supertrait ====================
 
 /// Combined storage trait. Every storage backend must implement all sub-traits.
@@ -974,12 +1248,14 @@ pub trait Storage:
     + SearchStore
     + ChatStore
     + WikiStore
-    + BriefingStore
     + FeedStore
     + ClusterStore
     + SettingsStore
     + TokenStore
     + DatabaseStore
+    + TaskRunStore
+    + ReportStore
+    + LegacyBriefingsMigrationStore
     + Send
     + Sync
 {

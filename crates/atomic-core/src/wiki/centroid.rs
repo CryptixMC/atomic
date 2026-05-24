@@ -182,18 +182,28 @@ pub(crate) fn select_chunks_by_centroid(
 }
 
 /// Fallback: select chunks by insertion order up to the token budget.
+///
+/// Takes the pre-resolved `scoped_atom_ids` set (same input as the centroid
+/// path) so kind / tag scoping live in exactly one place — the caller's
+/// scope-resolution query — and cannot drift between the ranked and
+/// unranked paths.
 pub(crate) fn select_chunks_unranked(
     conn: &Connection,
-    placeholders: &str,
-    all_tag_ids: &[String],
+    scoped_atom_ids: &std::collections::HashSet<String>,
     max_source_tokens: usize,
 ) -> Result<Vec<ChunkWithContext>, String> {
+    if scoped_atom_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = scoped_atom_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!(
-        "SELECT DISTINCT ac.atom_id, ac.chunk_index, ac.content
-         FROM atom_chunks ac
-         INNER JOIN atom_tags at ON ac.atom_id = at.atom_id
-         WHERE at.tag_id IN ({})
-         ORDER BY ac.atom_id, ac.chunk_index",
+        "SELECT atom_id, chunk_index, content FROM atom_chunks
+         WHERE atom_id IN ({})
+         ORDER BY atom_id, chunk_index",
         placeholders
     );
 
@@ -201,8 +211,9 @@ pub(crate) fn select_chunks_unranked(
         .prepare(&query)
         .map_err(|e| format!("Failed to prepare chunks query: {}", e))?;
 
+    let params: Vec<&str> = scoped_atom_ids.iter().map(|s| s.as_str()).collect();
     let mut rows = stmt
-        .query(rusqlite::params_from_iter(all_tag_ids.iter()))
+        .query(rusqlite::params_from_iter(params.iter()))
         .map_err(|e| format!("Failed to query chunks: {}", e))?;
 
     let mut chunks = Vec::new();
@@ -260,71 +271,6 @@ async fn generate_wiki_content(
         system_prompt,
     )
     .await
-}
-
-/// Fallback for update: select new chunks by insertion order up to the token budget.
-pub(crate) fn select_new_chunks_unranked(
-    conn: &Connection,
-    new_atom_ids: &std::collections::HashSet<String>,
-    max_source_tokens: usize,
-) -> Result<Vec<ChunkWithContext>, String> {
-    if new_atom_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let placeholders = new_atom_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let query = format!(
-        "SELECT atom_id, chunk_index, content FROM atom_chunks WHERE atom_id IN ({}) ORDER BY atom_id, chunk_index",
-        placeholders
-    );
-
-    let mut stmt = conn
-        .prepare(&query)
-        .map_err(|e| format!("Failed to prepare new chunks query: {}", e))?;
-
-    let params: Vec<&str> = new_atom_ids.iter().map(|s| s.as_str()).collect();
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(params.iter()))
-        .map_err(|e| format!("Failed to query new chunks: {}", e))?;
-
-    let mut chunks = Vec::new();
-    let mut total_tokens = 0;
-
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| format!("Failed to read row: {}", e))?
-    {
-        let content: String = row
-            .get(2)
-            .map_err(|e| format!("Failed to get content: {}", e))?;
-        let tokens = count_tokens(&content);
-        if total_tokens + tokens > max_source_tokens && !chunks.is_empty() {
-            break;
-        }
-        total_tokens += tokens;
-        chunks.push(ChunkWithContext {
-            atom_id: row
-                .get(0)
-                .map_err(|e| format!("Failed to get atom_id: {}", e))?,
-            chunk_index: row
-                .get(1)
-                .map_err(|e| format!("Failed to get chunk_index: {}", e))?,
-            content,
-            similarity_score: 1.0,
-        });
-    }
-
-    tracing::info!(
-        chunks = chunks.len(),
-        tokens = total_tokens,
-        "[wiki/centroid] Selected new chunks by insertion order (no centroid)"
-    );
-
-    Ok(chunks)
 }
 
 /// Update wiki article content via API (async, no db needed)

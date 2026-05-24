@@ -26,7 +26,11 @@ pub async fn save_positions(db: Db, body: web::Json<Vec<AtomPosition>>) -> HttpR
 
 #[utoipa::path(get, path = "/api/canvas/atoms-with-embeddings", responses((status = 200, description = "Atoms with embedding vectors", body = Vec<atomic_core::AtomWithEmbedding>)), tag = "canvas")]
 pub async fn get_atoms_with_embeddings(db: Db) -> HttpResponse {
-    ok_or_error(db.0.get_atoms_with_embeddings().await)
+    // Canvas displays every atom in the graph, including future report findings.
+    ok_or_error(
+        db.0.get_atoms_with_embeddings(&atomic_core::models::KindFilter::All)
+            .await,
+    )
 }
 
 #[derive(Deserialize, IntoParams)]

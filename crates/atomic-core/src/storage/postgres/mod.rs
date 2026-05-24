@@ -7,7 +7,6 @@
 #[cfg(feature = "postgres")]
 mod atoms;
 #[cfg(feature = "postgres")]
-mod briefings;
 #[cfg(feature = "postgres")]
 mod chat;
 #[cfg(feature = "postgres")]
@@ -19,11 +18,15 @@ mod feeds;
 #[cfg(feature = "postgres")]
 mod oauth;
 #[cfg(feature = "postgres")]
+mod reports;
+#[cfg(feature = "postgres")]
 mod search;
 #[cfg(feature = "postgres")]
 mod settings;
 #[cfg(feature = "postgres")]
 mod tags;
+#[cfg(feature = "postgres")]
+mod task_runs;
 #[cfg(feature = "postgres")]
 mod wiki;
 
@@ -109,6 +112,14 @@ impl PostgresStorage {
             (11, include_str!("migrations/011_edges_status.sql")),
             (12, include_str!("migrations/012_autotag_description.sql")),
             (13, include_str!("migrations/013_atom_tags_source.sql")),
+            (14, include_str!("migrations/014_atoms_kind.sql")),
+            (15, include_str!("migrations/015_task_runs.sql")),
+            (16, include_str!("migrations/016_reports.sql")),
+            (
+                17,
+                include_str!("migrations/017_task_runs_active_unique.sql"),
+            ),
+            (18, include_str!("migrations/018_briefings_teardown.sql")),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations

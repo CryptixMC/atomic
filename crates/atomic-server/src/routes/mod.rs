@@ -2,10 +2,10 @@
 
 pub mod atoms;
 pub mod auth;
-pub mod briefings;
 pub mod canvas;
 pub mod chat;
 pub mod clustering;
+pub mod dashboard;
 pub mod databases;
 pub mod embedding;
 pub mod exports;
@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod logs;
 pub mod oauth;
 pub mod ollama;
+pub mod reports;
 pub mod search;
 pub mod settings;
 pub mod setup;
@@ -130,25 +131,39 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::post().to(wiki::recompute_all_tag_embeddings),
     );
 
-    // Briefings
+    // Dashboard
     cfg.route(
-        "/briefings/schedule",
-        web::get().to(briefings::get_briefing_schedule),
+        "/dashboard/featured-report",
+        web::get().to(dashboard::get_featured_report),
     );
     cfg.route(
-        "/briefings/schedule",
-        web::put().to(briefings::set_briefing_schedule),
+        "/dashboard/featured-report",
+        web::put().to(dashboard::set_featured_report),
+    );
+
+    // Reports (phase 2 — runs alongside the existing briefing path)
+    cfg.route("/reports", web::get().to(reports::list_reports));
+    cfg.route("/reports", web::post().to(reports::create_report));
+    cfg.route("/reports/{id}", web::get().to(reports::get_report));
+    cfg.route("/reports/{id}", web::put().to(reports::update_report));
+    cfg.route("/reports/{id}", web::delete().to(reports::delete_report));
+    cfg.route(
+        "/reports/{id}/enabled",
+        web::patch().to(reports::set_report_enabled),
+    );
+    cfg.route("/reports/{id}/run", web::post().to(reports::run_report_now));
+    cfg.route(
+        "/reports/{id}/findings",
+        web::get().to(reports::list_findings_for_report),
     );
     cfg.route(
-        "/briefings/latest",
-        web::get().to(briefings::get_latest_briefing),
+        "/findings/{atom_id}/citations",
+        web::get().to(reports::list_finding_citations),
     );
-    cfg.route("/briefings", web::get().to(briefings::list_briefings));
     cfg.route(
-        "/briefings/run",
-        web::post().to(briefings::run_briefing_now),
+        "/findings/{atom_id}",
+        web::get().to(reports::get_finding_provenance),
     );
-    cfg.route("/briefings/{id}", web::get().to(briefings::get_briefing));
 
     // Settings
     cfg.route("/settings", web::get().to(settings::get_settings));

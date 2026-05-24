@@ -12,7 +12,7 @@ use atomic_server::{
     export_jobs::ExportJobManager,
     log_buffer::LogBuffer,
     mcp, mcp_auth, routes,
-    state::{AppState, SetupClaimLimiter, SetupToken},
+    state::{AppState, ServerEvent, SetupClaimLimiter, SetupToken},
     ws, Scalar, Servable,
 };
 use clap::Parser;
@@ -366,6 +366,50 @@ async fn run_server(
         }
     }
 
+    // Phase-3 briefing collapse: seed the default Daily Briefing report and
+    // migrate historical briefings into finding atoms on every data DB.
+    // Both helpers are idempotent (the seed keys on
+    // `dashboard.featured_report_id` pointing at an extant report; the
+    // migration keys on a per-DB `briefings.migrated_to_findings` flag), so
+    // crashing partway through means the next boot resumes. We run this
+    // synchronously, before background loops spawn, so the reports tick
+    // never finds a half-migrated DB. A failure in one DB logs and skips
+    // that DB; we deliberately do not abort startup on a per-DB error.
+    {
+        let (databases, _) = manager.list_databases().await.unwrap_or_default();
+        for db_info in &databases {
+            let core = match manager.get_core(&db_info.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        db = %db_info.name, error = %e,
+                        "[reports/seed] failed to load database — skipping seed"
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = atomic_core::reports::seed::seed_default_briefing_report(&core).await {
+                tracing::error!(
+                    db = %db_info.name, error = %e,
+                    "[reports/seed] seed failed — skipping migration on this DB"
+                );
+                continue;
+            }
+            match atomic_core::reports::seed::migrate_briefings_to_findings(&core).await {
+                Ok(0) => {} // no-op: either already migrated or no rows
+                Ok(n) => tracing::info!(
+                    db = %db_info.name,
+                    migrated = n,
+                    "[reports/seed] briefings → findings migration complete"
+                ),
+                Err(e) => tracing::error!(
+                    db = %db_info.name, error = %e,
+                    "[reports/seed] migration failed — will retry on next boot"
+                ),
+            }
+        }
+    }
+
     // Canvas cache warmup: compute the global canvas payload for every
     // database in the background so the first request after startup hits a
     // warm cache. Sequenced across databases (not parallel) to avoid an
@@ -453,7 +497,9 @@ async fn run_server(
         let task_tx = event_tx.clone();
         tokio::spawn(async move {
             let mut registry = atomic_core::scheduler::TaskRegistry::new();
-            registry.register(Arc::new(atomic_core::briefing::DailyBriefingTask));
+            // DailyBriefingTask retired in phase 3 — the seeded Daily Briefing
+            // report runs through the reports loop below, dispatched via the
+            // task_runs ledger.
             registry.register(Arc::new(atomic_core::pipeline_task::DraftPipelineTask));
             registry.register(Arc::new(
                 atomic_core::graph_maintenance::GraphMaintenanceTask,
@@ -498,6 +544,100 @@ async fn run_server(
                                 );
                             }
                             drop(guard);
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    // Reports runner. Independent of the legacy scheduler tick: reports
+    // are dynamic per-DB, gated by cron, and dispatched through the
+    // `task_runs` ledger from phase 1.5. Each tick we iterate every DB,
+    // list enabled reports, and call `claim_or_create` for due ones; the
+    // ledger's conditional-update guards against double-firing if a
+    // previous tick is still running.
+    {
+        let reports_manager = Arc::clone(&manager);
+        let reports_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let databases = match reports_manager.list_databases().await {
+                    Ok((dbs, _)) => dbs,
+                    Err(_) => continue,
+                };
+                for db_info in &databases {
+                    let core = match reports_manager.get_core(&db_info.id).await {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let reports = match core.list_enabled_reports().await {
+                        Ok(rs) => rs,
+                        Err(e) => {
+                            tracing::warn!(db = %db_info.id, error = %e, "[reports] list failed");
+                            continue;
+                        }
+                    };
+                    let now = chrono::Utc::now();
+                    for report in reports {
+                        if !atomic_core::reports::schedule::is_due(&report, now) {
+                            continue;
+                        }
+                        let core_clone = core.clone();
+                        let run_tx = reports_tx.clone();
+                        tokio::spawn(async move {
+                            match atomic_core::reports::run_report(
+                                &core_clone,
+                                &report,
+                                atomic_core::models::TaskRunTrigger::Schedule,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => {
+                                    tracing::info!(
+                                        report_id = %report.id,
+                                        outcome = ?outcome,
+                                        "[reports] scheduled run complete"
+                                    );
+                                    // Broadcast `atom-created` for the new
+                                    // finding so the dashboard widget
+                                    // refreshes live. The runner writes
+                                    // directly through storage and doesn't
+                                    // touch the event bridge, so without
+                                    // this an open dashboard would only
+                                    // see the new finding after a manual
+                                    // refresh or DB switch.
+                                    if let atomic_core::reports::RunOutcome::Succeeded {
+                                        finding_atom_id,
+                                    } = outcome
+                                    {
+                                        match core_clone.get_atom(&finding_atom_id).await {
+                                            Ok(Some(atom)) => {
+                                                let _ =
+                                                    run_tx.send(ServerEvent::AtomCreated { atom });
+                                            }
+                                            Ok(None) => tracing::warn!(
+                                                report_id = %report.id,
+                                                finding_atom_id = %finding_atom_id,
+                                                "[reports] finding atom missing after write — skipping broadcast"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                report_id = %report.id,
+                                                error = %e,
+                                                "[reports] finding fetch for broadcast failed"
+                                            ),
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    report_id = %report.id,
+                                    error = %e,
+                                    "[reports] scheduled run failed"
+                                ),
+                            }
                         });
                     }
                 }

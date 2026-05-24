@@ -23,8 +23,16 @@ impl PostgresStorage {
             });
         }
 
+        // Global search is the in-app palette — show every kind, mirroring
+        // the SQLite path and the UI list/canvas surfaces.
         let atoms = self
-            .keyword_search(query_trimmed, section_limit, None, None)
+            .keyword_search(
+                query_trimmed,
+                section_limit,
+                None,
+                None,
+                &crate::models::KindFilter::All,
+            )
             .await?;
         let wiki =
             pg_keyword_search_wiki(&self.pool, query_trimmed, section_limit, &self.db_id).await?;
@@ -51,6 +59,7 @@ impl SearchStore for PostgresStorage {
         threshold: f32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let embedding_vec = Vector::from(query_embedding.to_vec());
         let fetch_limit = limit * 10;
@@ -114,12 +123,36 @@ impl SearchStore for PostgresStorage {
         } else {
             std::collections::HashSet::new()
         };
+        // Kind filtering. `None` = `KindFilter::All` (no filter applied).
+        let kind_allowed: Option<std::collections::HashSet<String>> =
+            if matches!(kinds, crate::models::KindFilter::All) {
+                None
+            } else {
+                let candidate_atom_ids: Vec<&str> = filtered
+                    .iter()
+                    .map(|(_, aid, _, _, _)| aid.as_str())
+                    .collect();
+                Some(
+                    pg_batch_atoms_matching_kind(
+                        &self.pool,
+                        &candidate_atom_ids,
+                        kinds,
+                        &self.db_id,
+                    )
+                    .await?,
+                )
+            };
 
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();
         for (_chunk_id, atom_id, content, chunk_index, similarity) in &filtered {
             if tag_id.is_some() && !scope_atom_ids.contains(atom_id) {
                 continue;
+            }
+            if let Some(ref allowed) = kind_allowed {
+                if !allowed.contains(atom_id) {
+                    continue;
+                }
             }
             let entry = atom_best.entry(atom_id.clone());
             match entry {
@@ -175,6 +208,7 @@ impl SearchStore for PostgresStorage {
         limit: i32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let query_trimmed = query.trim();
         if query_trimmed.is_empty() {
@@ -236,6 +270,28 @@ impl SearchStore for PostgresStorage {
             rows
         };
 
+        // Apply kind filter post-pass (FTS index is kind-agnostic).
+        let filtered: Vec<(String, String, String, i32, f32)> =
+            if matches!(kinds, crate::models::KindFilter::All) {
+                filtered
+            } else {
+                let candidate_atom_ids: Vec<&str> = filtered
+                    .iter()
+                    .map(|(_, aid, _, _, _)| aid.as_str())
+                    .collect();
+                let allowed = pg_batch_atoms_matching_kind(
+                    &self.pool,
+                    &candidate_atom_ids,
+                    kinds,
+                    &self.db_id,
+                )
+                .await?;
+                filtered
+                    .into_iter()
+                    .filter(|(_, aid, _, _, _)| allowed.contains(aid.as_str()))
+                    .collect()
+            };
+
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();
         for (_chunk_id, atom_id, content, chunk_index, rank) in &filtered {
@@ -295,6 +351,7 @@ impl SearchStore for PostgresStorage {
         limit: i32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
         let query_trimmed = query.trim();
         if query_trimmed.is_empty() {
@@ -355,6 +412,23 @@ impl SearchStore for PostgresStorage {
                 .collect()
         };
 
+        // Apply kind filter (post-pass)
+        let filtered = if matches!(kinds, crate::models::KindFilter::All) {
+            filtered
+        } else {
+            let candidate_atom_ids: Vec<&str> = filtered
+                .iter()
+                .map(|(_, aid, _, _, _)| aid.as_str())
+                .collect();
+            let allowed =
+                pg_batch_atoms_matching_kind(&self.pool, &candidate_atom_ids, kinds, &self.db_id)
+                    .await?;
+            filtered
+                .into_iter()
+                .filter(|(_, aid, _, _, _)| allowed.contains(aid.as_str()))
+                .collect()
+        };
+
         Ok(filtered
             .into_iter()
             .take(limit as usize)
@@ -377,6 +451,7 @@ impl SearchStore for PostgresStorage {
         threshold: f32,
         scope_tag_ids: &[String],
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
         let embedding_vec = Vector::from(query_embedding.to_vec());
         let fetch_limit = limit * 5;
@@ -440,6 +515,23 @@ impl SearchStore for PostgresStorage {
             filtered
                 .into_iter()
                 .filter(|(_, aid, _, _, _)| matching.contains(aid.as_str()))
+                .collect()
+        };
+
+        // Apply kind filter
+        let scoped = if matches!(kinds, crate::models::KindFilter::All) {
+            scoped
+        } else {
+            let candidate_atom_ids: Vec<&str> = scoped
+                .iter()
+                .map(|(_, aid, _, _, _)| aid.as_str())
+                .collect();
+            let allowed =
+                pg_batch_atoms_matching_kind(&self.pool, &candidate_atom_ids, kinds, &self.db_id)
+                    .await?;
+            scoped
+                .into_iter()
+                .filter(|(_, aid, _, _, _)| allowed.contains(aid.as_str()))
                 .collect()
         };
 
@@ -581,12 +673,14 @@ async fn pg_batch_fetch_atoms(
         String,
         Option<String>,
         Option<String>,
+        String,
     )> = sqlx::query_as(
         "SELECT id, content, title, snippet, source_url, source, published_at,
                 created_at, updated_at,
                 COALESCE(embedding_status, 'pending'),
                 COALESCE(tagging_status, 'pending'),
-                embedding_error, tagging_error
+                embedding_error, tagging_error,
+                COALESCE(kind, 'captured')
          FROM atoms WHERE id = ANY($1) AND db_id = $2",
     )
     .bind(atom_ids)
@@ -598,6 +692,9 @@ async fn pg_batch_fetch_atoms(
     Ok(rows
         .into_iter()
         .map(|r| {
+            let kind =
+                r.13.parse::<crate::models::AtomKind>()
+                    .unwrap_or(crate::models::AtomKind::Captured);
             let atom = Atom {
                 id: r.0.clone(),
                 content: r.1,
@@ -612,6 +709,7 @@ async fn pg_batch_fetch_atoms(
                 tagging_status: r.10,
                 embedding_error: r.11,
                 tagging_error: r.12,
+                kind,
             };
             (r.0, atom)
         })
@@ -688,6 +786,36 @@ async fn pg_batch_atoms_with_scope_tags(
     .await
     .map_err(|e| AtomicCoreError::Search(format!("Failed to check scope tags: {}", e)))?;
 
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Batch lookup of which atom_ids match the given `KindFilter`. Caller is
+/// expected to skip the call for `KindFilter::All` (which is a no-op).
+async fn pg_batch_atoms_matching_kind(
+    pool: &sqlx::PgPool,
+    atom_ids: &[&str],
+    kinds: &crate::models::KindFilter,
+    db_id: &str,
+) -> Result<std::collections::HashSet<String>, AtomicCoreError> {
+    if atom_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let kind_predicate = kinds.postgres_predicate("kind", "$3");
+    let sql = format!(
+        "SELECT id FROM atoms
+         WHERE id = ANY($1) AND db_id = $2 AND {kind_predicate}"
+    );
+    let atom_id_strings: Vec<String> = atom_ids.iter().map(|s| s.to_string()).collect();
+    let mut q = sqlx::query_as::<_, (String,)>(&sql)
+        .bind(&atom_id_strings)
+        .bind(db_id);
+    if kinds.has_bind_value() {
+        q = q.bind(kinds.kind_strings());
+    }
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AtomicCoreError::Search(format!("Failed to check kind filter: {}", e)))?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 

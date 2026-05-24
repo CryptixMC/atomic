@@ -155,21 +155,37 @@ impl SqliteStorage {
             ));
         }
 
-        // Build scoped atom IDs
-        let placeholders = all_tag_ids
+        // Wiki context-assembly is captured-only — and the kind filter MUST
+        // apply at scope-resolution, not just at the final atom count. If we
+        // filter only the count, the centroid/unranked chunk selectors below
+        // still see report-kind atoms in `scoped_atom_ids` and can hand their
+        // chunks to the LLM as wiki sources. Filter once, at the source.
+        let captured = crate::models::KindFilter::only(crate::models::AtomKind::Captured);
+        let (kind_frag, kind_binds) = captured.sqlite_in_clause("a.kind");
+        let tag_placeholders = all_tag_ids
             .iter()
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(",");
         let atom_ids_query = format!(
-            "SELECT DISTINCT atom_id FROM atom_tags WHERE tag_id IN ({})",
-            placeholders
+            "SELECT DISTINCT at.atom_id
+             FROM atom_tags at
+             INNER JOIN atoms a ON a.id = at.atom_id
+             WHERE at.tag_id IN ({tag_placeholders})
+               AND {kind_frag}"
         );
         let mut stmt = conn.prepare(&atom_ids_query).map_err(|e| {
             AtomicCoreError::Wiki(format!("Failed to prepare atom_ids query: {}", e))
         })?;
+        let mut bind_refs: Vec<&dyn rusqlite::ToSql> = all_tag_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        for v in &kind_binds {
+            bind_refs.push(v as &dyn rusqlite::ToSql);
+        }
         let scoped_atom_ids: std::collections::HashSet<String> = stmt
-            .query_map(rusqlite::params_from_iter(all_tag_ids.iter()), |row| {
+            .query_map(rusqlite::params_from_iter(bind_refs.iter()), |row| {
                 row.get(0)
             })
             .map_err(|e| AtomicCoreError::Wiki(format!("Failed to query atom_ids: {}", e)))?
@@ -204,13 +220,8 @@ impl SqliteStorage {
                 tag_id,
                 "[wiki/storage] No centroid for tag, falling back to unranked chunk selection"
             );
-            wiki::centroid::select_chunks_unranked(
-                &conn,
-                &placeholders,
-                &all_tag_ids,
-                max_source_tokens,
-            )
-            .map_err(|e| AtomicCoreError::Wiki(e))?
+            wiki::centroid::select_chunks_unranked(&conn, &scoped_atom_ids, max_source_tokens)
+                .map_err(|e| AtomicCoreError::Wiki(e))?
         };
 
         if chunks.is_empty() {
@@ -219,7 +230,8 @@ impl SqliteStorage {
             ));
         }
 
-        let atom_count = wiki::count_atoms_with_tags(&conn, &all_tag_ids)
+        // Count must match the scope used above — both kind-filtered.
+        let atom_count = wiki::count_atoms_with_tags(&conn, &all_tag_ids, &captured)
             .map_err(|e| AtomicCoreError::Wiki(e))?;
 
         Ok((chunks, atom_count))
@@ -233,9 +245,9 @@ impl SqliteStorage {
     ) -> StorageResult<Option<(Vec<ChunkWithContext>, i32)>> {
         let conn = self.db.read_conn()?;
 
-        // Get atoms added after the last update, spanning the full tag hierarchy
-        // (same scope as generation and get_article_status — prevents "N new atoms"
-        // banners for atoms in child tags that the LLM can never see as updates).
+        // New atoms scope must also be kind-filtered. An update can otherwise
+        // start feeding report-kind atoms produced *after* the last article
+        // revision back into the wiki LLM as "new sources to incorporate."
         let mut new_atom_stmt = conn
             .prepare(
                 "WITH RECURSIVE descendant_tags(id) AS (
@@ -247,7 +259,8 @@ impl SqliteStorage {
                  SELECT DISTINCT a.id FROM atoms a
                  INNER JOIN atom_tags at ON a.id = at.atom_id
                  WHERE at.tag_id IN (SELECT id FROM descendant_tags)
-                   AND a.created_at > ?2",
+                   AND a.created_at > ?2
+                   AND a.kind = 'captured'",
             )
             .map_err(|e| {
                 AtomicCoreError::Wiki(format!("Failed to prepare new atoms query: {}", e))
@@ -284,7 +297,7 @@ impl SqliteStorage {
             .map_err(|e| AtomicCoreError::Wiki(e))?
         } else {
             tracing::debug!(tag_id, "[wiki/storage] No centroid for tag, falling back to unranked update chunk selection");
-            wiki::centroid::select_new_chunks_unranked(&conn, &new_atom_id_set, max_source_tokens)
+            wiki::centroid::select_chunks_unranked(&conn, &new_atom_id_set, max_source_tokens)
                 .map_err(|e| AtomicCoreError::Wiki(e))?
         };
 
@@ -293,12 +306,9 @@ impl SqliteStorage {
                 tag_id,
                 "[wiki/storage] No centroid-ranked update chunks found, falling back to unranked update chunk selection"
             );
-            new_chunks = wiki::centroid::select_new_chunks_unranked(
-                &conn,
-                &new_atom_id_set,
-                max_source_tokens,
-            )
-            .map_err(|e| AtomicCoreError::Wiki(e))?;
+            new_chunks =
+                wiki::centroid::select_chunks_unranked(&conn, &new_atom_id_set, max_source_tokens)
+                    .map_err(|e| AtomicCoreError::Wiki(e))?;
         }
 
         if new_chunks.is_empty() {
@@ -308,22 +318,17 @@ impl SqliteStorage {
             ));
         }
 
-        // Count uses the same descendant CTE as get_article_status so the
-        // stored atom_count stays in sync with what the banner reports.
-        let atom_count: i32 = conn
-            .query_row(
-                "WITH RECURSIVE descendant_tags(id) AS (
-                     SELECT ?1
-                     UNION ALL
-                     SELECT t.id FROM tags t
-                     INNER JOIN descendant_tags dt ON t.parent_id = dt.id
-                 )
-                 SELECT COUNT(DISTINCT atom_id) FROM atom_tags
-                 WHERE tag_id IN (SELECT id FROM descendant_tags)",
-                [tag_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| AtomicCoreError::Wiki(format!("Failed to count atoms: {}", e)))?;
+        // Count must be consistent with the source-chunk path: captured-only
+        // total under the tag hierarchy. Otherwise the stored `atom_count`
+        // tracks a different population than what generation/update sourced.
+        let all_tag_ids =
+            wiki::get_tag_hierarchy(&conn, tag_id).map_err(|e| AtomicCoreError::Wiki(e))?;
+        let atom_count = wiki::count_atoms_with_tags(
+            &conn,
+            &all_tag_ids,
+            &crate::models::KindFilter::only(crate::models::AtomKind::Captured),
+        )
+        .map_err(|e| AtomicCoreError::Wiki(e))?;
 
         Ok(Some((new_chunks, atom_count)))
     }

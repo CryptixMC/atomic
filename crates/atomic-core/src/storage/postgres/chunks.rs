@@ -545,12 +545,14 @@ impl ChunkStore for PostgresStorage {
             String,
             Option<String>,
             Option<String>,
+            String,
         )> = sqlx::query_as(
             "SELECT id, content, title, snippet, source_url, source, published_at,
                     created_at, updated_at,
                     COALESCE(embedding_status, 'pending'),
                     COALESCE(tagging_status, 'pending'),
-                    embedding_error, tagging_error
+                    embedding_error, tagging_error,
+                    COALESCE(kind, 'captured')
              FROM atoms WHERE id = ANY($1) AND db_id = $2",
         )
         .bind(&atom_ids)
@@ -567,6 +569,9 @@ impl ChunkStore for PostgresStorage {
         let atom_lookup: HashMap<String, Atom> = atom_rows
             .into_iter()
             .map(|r| {
+                let kind =
+                    r.13.parse::<crate::models::AtomKind>()
+                        .unwrap_or(crate::models::AtomKind::Captured);
                 let atom = Atom {
                     id: r.0.clone(),
                     content: r.1,
@@ -581,6 +586,7 @@ impl ChunkStore for PostgresStorage {
                     tagging_status: r.10,
                     embedding_error: r.11,
                     tagging_error: r.12,
+                    kind,
                 };
                 (r.0, atom)
             })

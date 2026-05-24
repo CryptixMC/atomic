@@ -194,6 +194,15 @@ impl SpawnArg for Option<&str> {
     }
 }
 
+// Nested-optional encoding for partial updates that distinguish "leave
+// unchanged" (outer None) from "clear" (Some(None)) from "set" (Some(Some)).
+impl SpawnArg for Option<Option<&str>> {
+    type Owned = Option<Option<String>>;
+    fn into_spawn_arg(self) -> Option<Option<String>> {
+        self.map(|inner| inner.map(|s| s.to_string()))
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> SpawnArg for Option<&[T]> {
     type Owned = Option<Vec<T>>;
     fn into_spawn_arg(self) -> Option<Vec<T>> {
@@ -237,6 +246,13 @@ impl<'a> ReborrowArg<'a> for Option<String> {
     }
 }
 
+impl<'a> ReborrowArg<'a> for Option<Option<String>> {
+    type Out = Option<Option<&'a str>>;
+    fn reborrow_arg(&'a self) -> Option<Option<&'a str>> {
+        self.as_ref().map(|inner| inner.as_deref())
+    }
+}
+
 impl<'a, T: 'a> ReborrowArg<'a> for Option<Vec<T>> {
     type Out = Option<&'a [T]>;
     fn reborrow_arg(&'a self) -> Option<&'a [T]> {
@@ -273,7 +289,11 @@ impl_reborrow_struct!(
     ListAtomsParams,
     WikiArticle,
     WikiProposal,
-    crate::briefing::Briefing,
+    crate::models::KindFilter,
+    crate::models::TaskRun,
+    crate::models::CreateReportRequest,
+    crate::models::UpdateReportRequest,
+    crate::models::ReportFinding,
 );
 
 /// Macro to generate async dispatch methods. For each method:
@@ -289,6 +309,12 @@ macro_rules! dispatch {
     ) => {
         impl StorageBackend {
             $(
+                // Some dispatch entries are dormant in non-test builds —
+                // they exist to round out the storage surface for upcoming
+                // phases (e.g. task_runs history before the reports UI
+                // ships). Suppress the noise; missing-impl regressions
+                // would still fail to compile.
+                #[allow(dead_code)]
                 pub(crate) async fn $name(&self $(, $arg: $argty)*) -> $ret {
                     match self {
                         StorageBackend::Sqlite(s) => {
@@ -331,13 +357,13 @@ dispatch! {
         => sqlite: update_atom_content_only_impl, pg_trait: AtomStore, pg_method: update_atom_content_only;
     fn delete_atom_impl(&self, id: &str) -> Result<(), AtomicCoreError>
         => sqlite: delete_atom_impl, pg_trait: AtomStore, pg_method: delete_atom;
-    fn get_atoms_by_tag_impl(&self, tag_id: &str) -> Result<Vec<AtomWithTags>, AtomicCoreError>
+    fn get_atoms_by_tag_impl(&self, tag_id: &str, kinds: &crate::models::KindFilter) -> Result<Vec<AtomWithTags>, AtomicCoreError>
         => sqlite: get_atoms_by_tag_impl, pg_trait: AtomStore, pg_method: get_atoms_by_tag;
     fn get_atom_links_impl(&self, atom_id: &str) -> Result<Vec<AtomLink>, AtomicCoreError>
         => sqlite: get_atom_links_impl, pg_trait: AtomStore, pg_method: get_atom_links;
     fn suggest_atom_links_impl(&self, query: &str, limit: i32) -> Result<Vec<AtomLinkSuggestion>, AtomicCoreError>
         => sqlite: suggest_atom_links_impl, pg_trait: AtomStore, pg_method: suggest_atom_links;
-    fn list_atoms_impl(&self, params: &ListAtomsParams) -> Result<PaginatedAtoms, AtomicCoreError>
+    fn list_atoms_impl(&self, params: &ListAtomsParams, kinds: &crate::models::KindFilter) -> Result<PaginatedAtoms, AtomicCoreError>
         => sqlite: list_atoms_impl, pg_trait: AtomStore, pg_method: list_atoms;
     fn get_source_list_impl(&self) -> Result<Vec<SourceInfo>, AtomicCoreError>
         => sqlite: get_source_list_impl, pg_trait: AtomStore, pg_method: get_source_list;
@@ -349,7 +375,7 @@ dispatch! {
         => sqlite: get_atom_positions_impl, pg_trait: AtomStore, pg_method: get_atom_positions;
     fn save_atom_positions_impl(&self, positions: &[AtomPosition]) -> Result<(), AtomicCoreError>
         => sqlite: save_atom_positions_impl, pg_trait: AtomStore, pg_method: save_atom_positions;
-    fn get_atoms_with_embeddings_impl(&self) -> Result<Vec<AtomWithEmbedding>, AtomicCoreError>
+    fn get_atoms_with_embeddings_impl(&self, kinds: &crate::models::KindFilter) -> Result<Vec<AtomWithEmbedding>, AtomicCoreError>
         => sqlite: get_atoms_with_embeddings_impl, pg_trait: AtomStore, pg_method: get_atoms_with_embeddings;
     fn get_tag_ids_for_atoms_batch_impl(&self, atom_ids: &[String]) -> Result<Vec<String>, AtomicCoreError>
         => sqlite: get_tag_ids_for_atoms_batch_impl, pg_trait: AtomStore, pg_method: get_tag_ids_for_atoms_batch;
@@ -367,8 +393,12 @@ dispatch! {
         => sqlite: get_all_embedding_pairs_sync, pg_trait: AtomStore, pg_method: get_all_embedding_pairs;
     fn get_all_atom_tag_ids_sync(&self) -> Result<std::collections::HashMap<String, Vec<String>>, AtomicCoreError>
         => sqlite: get_all_atom_tag_ids_sync, pg_trait: AtomStore, pg_method: get_all_atom_tag_ids;
-    fn get_canvas_atom_metadata_light_sync(&self) -> Result<Vec<(String, String, Option<String>, i32, Option<String>)>, AtomicCoreError>
+    fn get_canvas_atom_metadata_light_sync(&self, kinds: &crate::models::KindFilter) -> Result<Vec<(String, String, Option<String>, i32, Option<String>)>, AtomicCoreError>
         => sqlite: get_canvas_atom_metadata_light_sync, pg_trait: AtomStore, pg_method: get_canvas_atom_metadata_light;
+    fn list_atoms_for_report_scope_sync(&self, tag_ids: &[String], since: Option<&str>, kinds: &crate::models::KindFilter, limit: Option<i32>) -> Result<Vec<AtomWithTags>, AtomicCoreError>
+        => sqlite: list_atoms_for_report_scope_sync, pg_trait: AtomStore, pg_method: list_atoms_for_report_scope;
+    fn count_atoms_for_report_scope_sync(&self, tag_ids: &[String], since: Option<&str>, kinds: &crate::models::KindFilter) -> Result<i32, AtomicCoreError>
+        => sqlite: count_atoms_for_report_scope_sync, pg_trait: AtomStore, pg_method: count_atoms_for_report_scope;
 
     // ---- TagStore ----
     fn get_all_tags_impl(&self) -> Result<Vec<TagWithCount>, AtomicCoreError>
@@ -405,7 +435,7 @@ dispatch! {
         => sqlite: compute_tag_centroids_batch_impl, pg_trait: TagStore, pg_method: compute_tag_centroids_batch;
     fn get_tag_hierarchy_impl(&self, tag_id: &str) -> Result<Vec<String>, AtomicCoreError>
         => sqlite: get_tag_hierarchy_impl, pg_trait: TagStore, pg_method: get_tag_hierarchy;
-    fn count_atoms_with_tags_impl(&self, tag_ids: &[String]) -> Result<i32, AtomicCoreError>
+    fn count_atoms_with_tags_impl(&self, tag_ids: &[String], kinds: &crate::models::KindFilter) -> Result<i32, AtomicCoreError>
         => sqlite: count_atoms_with_tags_impl, pg_trait: TagStore, pg_method: count_atoms_with_tags;
 
     // ---- ChunkStore ----
@@ -479,15 +509,15 @@ dispatch! {
         => sqlite: count_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_pipeline_jobs;
 
     // ---- SearchStore ----
-    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: vector_search_sync, pg_trait: SearchStore, pg_method: vector_search;
-    fn keyword_search_sync(&self, query: &str, limit: i32, tag_id: Option<&str>, created_after: Option<&str>) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn keyword_search_sync(&self, query: &str, limit: i32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_sync, pg_trait: SearchStore, pg_method: keyword_search;
     fn find_similar_sync(&self, atom_id: &str, limit: i32, threshold: f32) -> Result<Vec<SimilarAtomResult>, AtomicCoreError>
         => sqlite: find_similar_sync, pg_trait: SearchStore, pg_method: find_similar;
-    fn keyword_search_chunks_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
+    fn keyword_search_chunks_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_chunks_sync, pg_trait: SearchStore, pg_method: keyword_search_chunks;
-    fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
+    fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: vector_search_chunks_sync, pg_trait: SearchStore, pg_method: vector_search_chunks;
 
     // ---- ChatStore ----
@@ -550,20 +580,6 @@ dispatch! {
     fn advance_wiki_baseline_sync(&self, tag_id: &str, max_current_count: Option<i32>) -> Result<bool, AtomicCoreError>
         => sqlite: advance_wiki_baseline_sync, pg_trait: WikiStore, pg_method: advance_wiki_baseline;
 
-    // ---- BriefingStore ----
-    fn list_new_atoms_since_sync(&self, since: &str, limit: i32) -> Result<Vec<AtomWithTags>, AtomicCoreError>
-        => sqlite: list_new_atoms_since_sync, pg_trait: BriefingStore, pg_method: list_new_atoms_since;
-    fn count_new_atoms_since_sync(&self, since: &str) -> Result<i32, AtomicCoreError>
-        => sqlite: count_new_atoms_since_sync, pg_trait: BriefingStore, pg_method: count_new_atoms_since;
-    fn insert_briefing_sync(&self, briefing: &crate::briefing::Briefing, citations: &[crate::briefing::BriefingCitation]) -> Result<crate::briefing::BriefingWithCitations, AtomicCoreError>
-        => sqlite: insert_briefing_sync, pg_trait: BriefingStore, pg_method: insert_briefing;
-    fn get_latest_briefing_sync(&self) -> Result<Option<crate::briefing::BriefingWithCitations>, AtomicCoreError>
-        => sqlite: get_latest_briefing_sync, pg_trait: BriefingStore, pg_method: get_latest_briefing;
-    fn get_briefing_sync(&self, id: &str) -> Result<Option<crate::briefing::BriefingWithCitations>, AtomicCoreError>
-        => sqlite: get_briefing_sync, pg_trait: BriefingStore, pg_method: get_briefing;
-    fn list_briefings_sync(&self, limit: i32) -> Result<Vec<crate::briefing::Briefing>, AtomicCoreError>
-        => sqlite: list_briefings_sync, pg_trait: BriefingStore, pg_method: list_briefings;
-
     // ---- FeedStore ----
     fn list_feeds_sync(&self) -> Result<Vec<Feed>, AtomicCoreError>
         => sqlite: list_feeds_sync, pg_trait: FeedStore, pg_method: list_feeds;
@@ -621,6 +637,66 @@ dispatch! {
         => sqlite: migrate_legacy_token_sync, pg_trait: TokenStore, pg_method: migrate_legacy_token;
     fn ensure_default_token_sync(&self) -> Result<Option<(crate::tokens::ApiTokenInfo, String)>, AtomicCoreError>
         => sqlite: ensure_default_token_sync, pg_trait: TokenStore, pg_method: ensure_default_token;
+
+    // ---- TaskRunStore ----
+    fn insert_task_run_sync(&self, run: &crate::models::TaskRun) -> Result<(), AtomicCoreError>
+        => sqlite: insert_task_run_sync, pg_trait: TaskRunStore, pg_method: insert_task_run;
+    fn try_insert_task_run_sync(&self, run: &crate::models::TaskRun) -> Result<bool, AtomicCoreError>
+        => sqlite: try_insert_task_run_sync, pg_trait: TaskRunStore, pg_method: try_insert_task_run;
+    fn get_task_run_sync(&self, id: &str) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: get_task_run_sync, pg_trait: TaskRunStore, pg_method: get_task_run;
+    fn find_runnable_task_run_sync(&self, task_id: &str, subject_id: Option<&str>, now: &str) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: find_runnable_task_run_sync, pg_trait: TaskRunStore, pg_method: find_runnable_task_run;
+    fn find_active_task_run_sync(&self, task_id: &str, subject_id: Option<&str>) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: find_active_task_run_sync, pg_trait: TaskRunStore, pg_method: find_active_task_run;
+    fn claim_pending_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: claim_pending_task_run_sync, pg_trait: TaskRunStore, pg_method: claim_pending_task_run;
+    fn reclaim_expired_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: reclaim_expired_task_run_sync, pg_trait: TaskRunStore, pg_method: reclaim_expired_task_run;
+    fn heartbeat_task_run_sync(&self, id: &str, expected_lease: &str, new_lease_until: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: heartbeat_task_run_sync, pg_trait: TaskRunStore, pg_method: heartbeat_task_run;
+    fn complete_task_run_sync(&self, id: &str, expected_lease: &str, result_id: Option<&str>, finished_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: complete_task_run_sync, pg_trait: TaskRunStore, pg_method: complete_task_run;
+    fn fail_task_run_retry_sync(&self, id: &str, expected_lease: &str, last_error: &str, now: &str, next_attempt_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: fail_task_run_retry_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_retry;
+    fn fail_task_run_abandon_sync(&self, id: &str, expected_lease: &str, last_error: &str, finished_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: fail_task_run_abandon_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_abandon;
+    fn list_recent_task_runs_sync(&self, task_id: &str, subject_id: Option<&str>, limit: i32) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: list_recent_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_recent_task_runs;
+
+    // ---- ReportStore ----
+    fn list_reports_sync(&self) -> Result<Vec<crate::models::Report>, AtomicCoreError>
+        => sqlite: list_reports_sync, pg_trait: ReportStore, pg_method: list_reports;
+    fn list_enabled_reports_sync(&self) -> Result<Vec<crate::models::Report>, AtomicCoreError>
+        => sqlite: list_enabled_reports_sync, pg_trait: ReportStore, pg_method: list_enabled_reports;
+    fn get_report_sync(&self, id: &str) -> Result<Option<crate::models::Report>, AtomicCoreError>
+        => sqlite: get_report_sync, pg_trait: ReportStore, pg_method: get_report;
+    fn insert_report_sync(&self, request: &crate::models::CreateReportRequest) -> Result<crate::models::Report, AtomicCoreError>
+        => sqlite: insert_report_sync, pg_trait: ReportStore, pg_method: insert_report;
+    fn update_report_sync(&self, id: &str, request: &crate::models::UpdateReportRequest) -> Result<crate::models::Report, AtomicCoreError>
+        => sqlite: update_report_sync, pg_trait: ReportStore, pg_method: update_report;
+    fn set_report_enabled_sync(&self, id: &str, enabled: bool) -> Result<(), AtomicCoreError>
+        => sqlite: set_report_enabled_sync, pg_trait: ReportStore, pg_method: set_report_enabled;
+    fn delete_report_sync(&self, id: &str) -> Result<(), AtomicCoreError>
+        => sqlite: delete_report_sync, pg_trait: ReportStore, pg_method: delete_report;
+    fn update_report_cache_sync(&self, id: &str, last_run_at: Option<&str>, last_finding_atom_id: Option<Option<&str>>, last_error: Option<Option<&str>>) -> Result<(), AtomicCoreError>
+        => sqlite: update_report_cache_sync, pg_trait: ReportStore, pg_method: update_report_cache;
+    fn list_findings_for_report_sync(&self, report_id: &str, limit: i32) -> Result<Vec<(crate::models::ReportFinding, crate::models::AtomWithTags)>, AtomicCoreError>
+        => sqlite: list_findings_for_report_sync, pg_trait: ReportStore, pg_method: list_findings_for_report;
+    fn get_finding_provenance_sync(&self, finding_atom_id: &str) -> Result<Option<crate::models::ReportFinding>, AtomicCoreError>
+        => sqlite: get_finding_provenance_sync, pg_trait: ReportStore, pg_method: get_finding_provenance;
+    fn list_finding_atom_ids_for_report_sync(&self, report_id: &str) -> Result<Vec<String>, AtomicCoreError>
+        => sqlite: list_finding_atom_ids_for_report_sync, pg_trait: ReportStore, pg_method: list_finding_atom_ids_for_report;
+    fn list_citations_for_finding_sync(&self, finding_atom_id: &str) -> Result<Vec<crate::models::ReportFindingCitation>, AtomicCoreError>
+        => sqlite: list_citations_for_finding_sync, pg_trait: ReportStore, pg_method: list_citations_for_finding;
+    fn write_finding_transactionally_sync(&self, atom_request: &CreateAtomRequest, atom_id: &str, atom_created_at: &str, provenance: &crate::models::ReportFinding, citations: &[crate::models::ReportFindingCitation]) -> Result<AtomWithTags, AtomicCoreError>
+        => sqlite: write_finding_transactionally_sync, pg_trait: ReportStore, pg_method: write_finding_transactionally;
+
+    // ---- LegacyBriefingsMigrationStore (phase-3 collapse) ----
+    fn fetch_legacy_briefings_sync(&self) -> Result<Vec<crate::reports::seed::LegacyBriefingRow>, AtomicCoreError>
+        => sqlite: fetch_legacy_briefings_sync, pg_trait: crate::storage::traits::LegacyBriefingsMigrationStore, pg_method: fetch_legacy_briefings;
+    fn drop_legacy_briefing_tables_sync(&self) -> Result<(), AtomicCoreError>
+        => sqlite: drop_legacy_briefing_tables_sync, pg_trait: crate::storage::traits::LegacyBriefingsMigrationStore, pg_method: drop_legacy_briefing_tables;
 }
 
 #[cfg(feature = "postgres")]

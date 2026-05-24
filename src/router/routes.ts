@@ -15,9 +15,11 @@ export type ParsedRoute =
   | { kind: 'view'; viewMode: ViewMode; tagId: string | null }
   | { kind: 'reader'; atomId: string; tagId: string | null }
   | { kind: 'graph'; atomId: string; tagId: string | null }
-  | { kind: 'wiki-reader'; tagId: string; tagName: string | null };
+  | { kind: 'wiki-reader'; tagId: string; tagName: string | null }
+  | { kind: 'reports-detail'; reportId: string }
+  | { kind: 'finding-reader'; atomId: string };
 
-const VIEW_MODES: ViewMode[] = ['dashboard', 'atoms', 'canvas', 'wiki'];
+const VIEW_MODES: ViewMode[] = ['dashboard', 'atoms', 'canvas', 'wiki', 'reports'];
 
 /// Build the URL for a base view, preserving the current tag scope.
 export function viewPath(mode: ViewMode, tagId?: string | null): string {
@@ -43,6 +45,21 @@ export function atomGraphPath(atomId: string, tagId?: string | null): string {
 export function wikiReaderPath(tagId: string, tagName?: string | null): string {
   const base = `/wiki-reader/${encodeURIComponent(tagId)}`;
   return tagName ? `${base}?name=${encodeURIComponent(tagName)}` : base;
+}
+
+/// Build the URL for an open report detail view. `/reports/:id` is
+/// parsed *before* the `/reports` base view so the more specific match
+/// wins.
+export function reportDetailPath(reportId: string): string {
+  return `/reports/${encodeURIComponent(reportId)}`;
+}
+
+/// Build the URL for a finding reader. Findings are atoms with
+/// `kind = 'report'`; their dedicated URL keeps the reader specialized
+/// (citation popovers, parent-report header) without polluting the
+/// `/atoms/:id` route, which still handles captured atoms.
+export function findingReaderPath(atomId: string): string {
+  return `/findings/${encodeURIComponent(atomId)}`;
 }
 
 /// Parse a pathname + search string into one of our known route shapes.
@@ -76,7 +93,24 @@ export function parseLocation(pathname: string, search: string): ParsedRoute {
     return { kind: 'wiki-reader', tagId: decodeURIComponent(wikiMatch[1]), tagName: name };
   }
 
-  // Base views: /, /atoms, /canvas, /wiki
+  // Report detail overlay: /reports/<id> — checked before the
+  // `/reports` base-view match so a deep-link to a specific report
+  // doesn't degrade to the list.
+  const reportMatch = path.match(/^\/reports\/([^/]+)$/);
+  if (reportMatch) {
+    return { kind: 'reports-detail', reportId: decodeURIComponent(reportMatch[1]) };
+  }
+
+  // Finding reader overlay: /findings/<atom_id>. Findings are atoms
+  // with `kind = 'report'`; the dedicated URL signals that the
+  // specialized reader (citation popovers, parent-report header)
+  // should mount instead of the generic AtomReader.
+  const findingMatch = path.match(/^\/findings\/([^/]+)$/);
+  if (findingMatch) {
+    return { kind: 'finding-reader', atomId: decodeURIComponent(findingMatch[1]) };
+  }
+
+  // Base views: /, /atoms, /canvas, /wiki, /reports
   if (path === '/') return { kind: 'view', viewMode: 'dashboard', tagId };
   const modeSegment = path.slice(1); // drop leading '/'
   if (VIEW_MODES.includes(modeSegment as ViewMode)) {

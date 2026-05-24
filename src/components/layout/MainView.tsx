@@ -11,6 +11,7 @@ import {
   BookOpen,
   Search,
   Filter,
+  Telescope,
 } from 'lucide-react';
 import { motion, LayoutGroup } from 'motion/react';
 import { AtomGrid } from '../atoms/AtomGrid';
@@ -24,6 +25,7 @@ import { DashboardView } from '../dashboard/DashboardView';
 import { FAB } from '../ui/FAB';
 import { WikiFullView } from '../wiki/WikiFullView';
 import { WikiReader } from '../wiki/WikiReader';
+import { ReportsFullView, ReportDetailView, FindingReader } from '../reports';
 import { ChatViewer } from '../chat/ChatViewer';
 import { TabStrip } from './TabStrip';
 import { useAtomsStore } from '../../stores/atoms';
@@ -65,6 +67,8 @@ export function MainView() {
   const openReader = useUIStore(s => s.openReader);
   const readerState = useUIStore(s => s.readerState);
   const wikiReaderState = useUIStore(s => s.wikiReaderState);
+  const reportsDetailState = useUIStore(s => s.reportsDetailState);
+  const findingReaderState = useUIStore(s => s.findingReaderState);
   const localGraph = useUIStore(s => s.localGraph);
 
   const openSearchPalette = useUIStore(s => s.openSearchPalette);
@@ -266,6 +270,7 @@ export function MainView() {
                 ['atoms', Library, 'Atoms'],
                 ['canvas', Network, 'Canvas view'],
                 ['wiki', BookOpen, 'Wiki view'],
+                ['reports', Telescope, 'Reports'],
               ] as const).map(([mode, IconCmp, label]) => {
                 const isActiveNav = onBaseView && viewMode === mode;
                 return (
@@ -428,10 +433,16 @@ export function MainView() {
             tagName={wikiReaderState.tagName}
             highlightText={wikiReaderState.highlightText}
           />
+        ) : findingReaderState.atomId ? (
+          <FindingReader atomId={findingReaderState.atomId} />
+        ) : reportsDetailState.reportId ? (
+          <ReportDetailView reportId={reportsDetailState.reportId} />
         ) : viewMode === 'dashboard' ? (
           <DashboardView />
         ) : viewMode === 'wiki' ? (
           <WikiFullView />
+        ) : viewMode === 'reports' ? (
+          <ReportsFullView />
         ) : viewMode === 'canvas' ? (
           <SigmaCanvas />
         ) : atomsLayout === 'grid' ? (

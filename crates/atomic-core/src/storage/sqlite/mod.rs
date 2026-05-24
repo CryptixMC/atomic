@@ -5,14 +5,15 @@
 //! wrapped in `tokio::task::spawn_blocking` to satisfy the async trait interface.
 
 mod atoms;
-mod briefings;
 mod chat;
 mod chunks;
 mod clusters;
 mod feeds;
+mod reports;
 mod search;
 mod settings;
 mod tags;
+mod task_runs;
 mod wiki;
 
 use crate::db::Database;

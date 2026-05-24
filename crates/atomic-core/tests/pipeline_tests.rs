@@ -768,7 +768,7 @@ async fn run_delete_cascade(backend: Backend) {
 
     // Physics tag is shared state — still present, now only linked to b.
     let remaining = core
-        .get_atoms_by_tag(&physics_id)
+        .get_atoms_by_tag(&physics_id, &atomic_core::models::KindFilter::All)
         .await
         .expect("get_atoms_by_tag");
     let ids: Vec<String> = remaining.iter().map(|a| a.atom.id.clone()).collect();

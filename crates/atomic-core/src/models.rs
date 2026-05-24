@@ -6,6 +6,140 @@ use serde::{Deserialize, Serialize};
 
 // ==================== Core KB Types ====================
 
+/// Discriminator distinguishing user-captured atoms from agent-emitted ones.
+///
+/// Every atom has exactly one kind. `Captured` is the default and the only
+/// value any production write path currently produces; `Report` is reserved
+/// for finding atoms emitted by scheduled report runs (see
+/// `docs/plans/reports.md`).
+///
+/// Variants serialize as lowercase strings (`"captured"`, `"report"`) to
+/// match the SQL column values exactly. The string form is the storage
+/// boundary; everywhere else in Rust this enum is the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtomKind {
+    Captured,
+    Report,
+}
+
+impl Default for AtomKind {
+    fn default() -> Self {
+        AtomKind::Captured
+    }
+}
+
+impl AtomKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AtomKind::Captured => "captured",
+            AtomKind::Report => "report",
+        }
+    }
+}
+
+impl std::fmt::Display for AtomKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AtomKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "captured" => Ok(AtomKind::Captured),
+            "report" => Ok(AtomKind::Report),
+            other => Err(format!("unknown AtomKind: {other}")),
+        }
+    }
+}
+
+/// Discriminator filter for atom queries.
+///
+/// Storage methods that return atoms for context assembly take `KindFilter`
+/// as a **non-defaulted** parameter — every call site must decide whether to
+/// include all kinds (`All`) or restrict to a subset (`Only`). Using an empty
+/// `Only(vec![])` is treated defensively as "match nothing" rather than
+/// silently degrading to no filter; the audit table in `docs/plans/reports.md`
+/// describes the intended choice for each consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindFilter {
+    All,
+    Only(Vec<AtomKind>),
+}
+
+impl KindFilter {
+    /// Convenience constructor for the common single-kind case.
+    pub fn only(kind: AtomKind) -> Self {
+        KindFilter::Only(vec![kind])
+    }
+
+    /// Returns `None` when no filtering applies; otherwise the subset.
+    /// Backends build their own `kind IN (...)` clause from this so neither
+    /// SQLite (`?`) nor Postgres (`$N`) placeholder dialects leak into the
+    /// type itself.
+    pub fn as_slice(&self) -> Option<&[AtomKind]> {
+        match self {
+            KindFilter::All => None,
+            KindFilter::Only(v) => Some(v.as_slice()),
+        }
+    }
+
+    /// Postgres predicate fragment using `= ANY($placeholder)`. The caller
+    /// supplies the placeholder it intends to bind to (e.g. `"$3"`) and is
+    /// responsible for binding the `Vec<String>` from [`Self::kind_strings`]
+    /// at that position. `All` returns a no-op `"true"`; an empty `Only`
+    /// returns `"false"` (defensive match-nothing).
+    pub fn postgres_predicate(&self, col: &str, placeholder: &str) -> String {
+        match self {
+            KindFilter::All => "true".to_string(),
+            KindFilter::Only(v) if v.is_empty() => "false".to_string(),
+            KindFilter::Only(_) => format!("{col} = ANY({placeholder})"),
+        }
+    }
+
+    /// The value vector to bind alongside [`Self::postgres_predicate`]. Empty
+    /// for `All` (no placeholder to bind); empty for empty `Only` (the
+    /// predicate is `false` so no bind position exists). Otherwise the kind
+    /// values as strings.
+    pub fn kind_strings(&self) -> Vec<String> {
+        match self {
+            KindFilter::All => Vec::new(),
+            KindFilter::Only(v) => v.iter().map(|k| k.as_str().to_string()).collect(),
+        }
+    }
+
+    /// True only when [`Self::postgres_predicate`] introduces an `$N`
+    /// placeholder that requires a corresponding `.bind(kind_strings())`.
+    /// `All` (`"true"`) and empty `Only` (`"false"`) emit no placeholder.
+    pub fn has_bind_value(&self) -> bool {
+        matches!(self, KindFilter::Only(v) if !v.is_empty())
+    }
+
+    /// Build an always-safe SQL fragment for splicing after `AND`/`WHERE`.
+    /// - `All`: `"1 = 1"` (no-op, lets the surrounding query stay structurally uniform).
+    /// - `Only([])`: `"1 = 0"` (defensive "match nothing").
+    /// - `Only([...])`: `"<col> IN (?, ?, ...)"` with `?` placeholders matching
+    ///   the SQLite dialect. Returns the matching bind values in order.
+    pub fn sqlite_in_clause(&self, col: &str) -> (String, Vec<&'static str>) {
+        match self {
+            KindFilter::All => ("1 = 1".to_string(), Vec::new()),
+            KindFilter::Only(kinds) if kinds.is_empty() => ("1 = 0".to_string(), Vec::new()),
+            KindFilter::Only(kinds) => {
+                let placeholders = std::iter::repeat("?")
+                    .take(kinds.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let frag = format!("{col} IN ({placeholders})");
+                let binds = kinds.iter().map(|k| k.as_str()).collect();
+                (frag, binds)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Atom {
@@ -22,6 +156,10 @@ pub struct Atom {
     pub tagging_status: String,   // 'pending', 'processing', 'complete', 'failed', 'skipped'
     pub embedding_error: Option<String>,
     pub tagging_error: Option<String>,
+    /// Discriminates user-captured atoms from agent-emitted findings.
+    /// Backwards-compatible default for clients that don't send the field.
+    #[serde(default)]
+    pub kind: AtomKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -872,4 +1010,501 @@ pub struct ExistingAtomChunk {
     pub atom_id: String,
     pub chunk_index: i32,
     pub content: String,
+}
+
+// ==================== Task Runs (Execution Ledger) ====================
+
+/// State machine vertex for a single task run.
+///
+/// Transitions are governed by the scheduler ledger; see
+/// `docs/plans/reports.md` §"Execution ledger — task_runs".
+///
+/// - `Pending → Running`: claim succeeds.
+/// - `Running → Succeeded`: terminal success; result_id set.
+/// - `Running → Pending`: retryable failure; attempts incremented,
+///   next_attempt_at set to backed-off future.
+/// - `Running → Abandoned`: terminal failure after max_attempts exhausted.
+/// - `Running → Running`: crash recovery — a stale lease is reclaimed without
+///   incrementing attempts.
+///
+/// String form matches the SQL column values exactly. Empty / unknown values
+/// fail `FromStr` rather than defaulting silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Abandoned,
+}
+
+impl TaskRunState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TaskRunState::Pending => "pending",
+            TaskRunState::Running => "running",
+            TaskRunState::Succeeded => "succeeded",
+            TaskRunState::Failed => "failed",
+            TaskRunState::Abandoned => "abandoned",
+        }
+    }
+
+    /// True for terminal states that should never transition further.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskRunState::Succeeded | TaskRunState::Failed | TaskRunState::Abandoned
+        )
+    }
+}
+
+impl std::fmt::Display for TaskRunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskRunState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(TaskRunState::Pending),
+            "running" => Ok(TaskRunState::Running),
+            "succeeded" => Ok(TaskRunState::Succeeded),
+            "failed" => Ok(TaskRunState::Failed),
+            "abandoned" => Ok(TaskRunState::Abandoned),
+            other => Err(format!("unknown TaskRunState: {other}")),
+        }
+    }
+}
+
+/// What woke the scheduler up for this run. Used to disambiguate "the cron
+/// fired" from "the user clicked run-now" in run history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunTrigger {
+    Schedule,
+    Manual,
+}
+
+impl TaskRunTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TaskRunTrigger::Schedule => "schedule",
+            TaskRunTrigger::Manual => "manual",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskRunTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskRunTrigger {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "schedule" => Ok(TaskRunTrigger::Schedule),
+            "manual" => Ok(TaskRunTrigger::Manual),
+            other => Err(format!("unknown TaskRunTrigger: {other}")),
+        }
+    }
+}
+
+/// One row of the `task_runs` execution ledger.
+///
+/// Owned, deserialized form of the persisted record. The authoritative state
+/// is the row in the database; this struct is a transport for that row, never
+/// a cache. Mutating helpers on the ledger module return a fresh `TaskRun`
+/// rather than editing this one in place so callers don't accidentally rely
+/// on stale `lease_until` after a heartbeat.
+///
+/// Timestamps are RFC3339 strings on SQLite and `TIMESTAMPTZ` on Postgres;
+/// `scope` is a JSON snapshot of the resolved source scope written by the
+/// caller at claim time (phase 1.5 leaves it `None`; phase 2 reports populate
+/// it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TaskRun {
+    pub id: String,
+    pub task_id: String,
+    pub subject_id: Option<String>,
+    pub state: TaskRunState,
+    pub trigger: TaskRunTrigger,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub lease_until: Option<String>,
+    pub next_attempt_at: String,
+    pub scope: Option<serde_json::Value>,
+    pub result_id: Option<String>,
+    pub last_error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ==================== Reports primitive ====================
+
+/// Source-scope time window. Resolved at run time by `crate::reports::scope`.
+///
+/// - `None`: no time bound, scope is just tag + kind filtered.
+/// - `SinceLastRun`: `atoms.created_at > reports.last_run_at` (treated as
+///   epoch 0 on first run, so the first run sees every atom in scope).
+/// - `Duration(iso)`: ISO-8601 duration like `P7D` or `PT24H`. Resolved to
+///   `atoms.created_at > now - duration` each tick.
+///
+/// Stored as a single TEXT column. `SinceLastRun` serializes as the literal
+/// `"since_last_run"`; durations as their ISO-8601 form; `None` as SQL NULL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SourceScopeWindow {
+    SinceLastRun,
+    Duration(String),
+}
+
+impl SourceScopeWindow {
+    /// Storage encoding for the `reports.source_scope_window` TEXT column.
+    /// `None` in Rust → SQL NULL; the enum itself never encodes NULL.
+    pub fn to_storage_str(&self) -> String {
+        match self {
+            SourceScopeWindow::SinceLastRun => "since_last_run".to_string(),
+            SourceScopeWindow::Duration(d) => d.clone(),
+        }
+    }
+
+    pub fn from_storage_str(s: &str) -> Result<Self, String> {
+        if s == "since_last_run" {
+            Ok(SourceScopeWindow::SinceLastRun)
+        } else if s.starts_with('P') {
+            Ok(SourceScopeWindow::Duration(s.to_string()))
+        } else {
+            Err(format!("unknown source_scope_window: {s}"))
+        }
+    }
+}
+
+/// Selector for what corpus the agent may search during a run.
+///
+/// - `SameAsSource`: context = source scope. Cheap meta-investigation mode.
+/// - `All`: search the full per-DB corpus (still kind-filtered by
+///   `context_include_kinds`). The daily-briefing default.
+/// - `Explicit`: search only atoms whose tag-subtree membership matches
+///   `context_scope_tag_ids` (kind-filtered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ContextScopeMode {
+    SameAsSource,
+    All,
+    Explicit,
+}
+
+impl Default for ContextScopeMode {
+    fn default() -> Self {
+        ContextScopeMode::All
+    }
+}
+
+impl ContextScopeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ContextScopeMode::SameAsSource => "same_as_source",
+            ContextScopeMode::All => "all",
+            ContextScopeMode::Explicit => "explicit",
+        }
+    }
+}
+
+impl std::fmt::Display for ContextScopeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ContextScopeMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "same_as_source" => Ok(ContextScopeMode::SameAsSource),
+            "all" => Ok(ContextScopeMode::All),
+            "explicit" => Ok(ContextScopeMode::Explicit),
+            other => Err(format!("unknown ContextScopeMode: {other}")),
+        }
+    }
+}
+
+/// Time bound applied to the context corpus (in addition to the mode-driven
+/// tag scope). `OlderThanSource` is the contradiction-scan idiom — search
+/// older material than the source batch to find conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ContextScopeWindow {
+    OlderThanSource,
+    Duration(String),
+}
+
+impl ContextScopeWindow {
+    pub fn to_storage_str(&self) -> String {
+        match self {
+            ContextScopeWindow::OlderThanSource => "older_than_source".to_string(),
+            ContextScopeWindow::Duration(d) => d.clone(),
+        }
+    }
+
+    pub fn from_storage_str(s: &str) -> Result<Self, String> {
+        if s == "older_than_source" {
+            Ok(ContextScopeWindow::OlderThanSource)
+        } else if s.starts_with('P') {
+            Ok(ContextScopeWindow::Duration(s.to_string()))
+        } else {
+            Err(format!("unknown context_scope_window: {s}"))
+        }
+    }
+}
+
+/// Citation policy decides which retrieved atoms may become formal
+/// citations in the final finding.
+///
+/// - `SourceOnly`: `[N]` markers may only resolve to atoms in the source
+///   batch. Search results are background only. Daily-briefing default.
+/// - `SourceAndContext`: each `semantic_search` result is assigned the
+///   next available citation number on first appearance and becomes
+///   citable. Required for contradiction / open-question reports that
+///   need to cite older material in the conclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CitationPolicy {
+    SourceOnly,
+    SourceAndContext,
+}
+
+impl Default for CitationPolicy {
+    fn default() -> Self {
+        CitationPolicy::SourceOnly
+    }
+}
+
+impl CitationPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CitationPolicy::SourceOnly => "source_only",
+            CitationPolicy::SourceAndContext => "source_and_context",
+        }
+    }
+}
+
+impl std::fmt::Display for CitationPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for CitationPolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "source_only" => Ok(CitationPolicy::SourceOnly),
+            "source_and_context" => Ok(CitationPolicy::SourceAndContext),
+            other => Err(format!("unknown CitationPolicy: {other}")),
+        }
+    }
+}
+
+/// A report definition. Authored by the user (or seeded as the default
+/// Daily Briefing), runs on its cron schedule, and produces finding atoms
+/// linked via `report_findings`.
+///
+/// Cache fields (`last_run_at`, `last_finding_atom_id`, `last_error`) are
+/// advisory — the authoritative state for execution lives on the
+/// `task_runs` ledger and `report_findings`. They exist so the scheduler
+/// tick and dashboard list view don't need to scan the ledger on every read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Report {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub research_prompt: String,
+
+    pub source_scope_tag_ids: Vec<String>,
+    pub source_scope_window: Option<SourceScopeWindow>,
+    pub source_include_kinds: Vec<AtomKind>,
+
+    pub context_scope_mode: ContextScopeMode,
+    pub context_scope_tag_ids: Vec<String>,
+    pub context_scope_window: Option<ContextScopeWindow>,
+    pub context_include_kinds: Vec<AtomKind>,
+
+    pub citation_policy: CitationPolicy,
+
+    pub max_source_atoms: Option<i32>,
+    pub max_source_tokens: Option<i32>,
+    pub max_tool_iterations: Option<i32>,
+
+    pub schedule: String,
+    pub schedule_tz: Option<String>,
+
+    pub enabled: bool,
+    pub output_atom_tags: Vec<String>,
+
+    pub last_run_at: Option<String>,
+    pub last_finding_atom_id: Option<String>,
+    pub last_error: Option<String>,
+
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Caller-supplied fields for `POST /api/reports`. Everything not in this
+/// struct (id, timestamps, cache fields, defaults) is generated by the
+/// storage layer.
+///
+/// `Default` is implemented manually rather than derived so the
+/// `enabled` and policy defaults match the serde defaults — derived
+/// `Default` would give `enabled = false` and `context_scope_mode =
+/// SameAsSource` (the first variant), neither of which is intended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CreateReportRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub research_prompt: String,
+
+    #[serde(default)]
+    pub source_scope_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub source_scope_window: Option<SourceScopeWindow>,
+    #[serde(default = "default_captured_kinds")]
+    pub source_include_kinds: Vec<AtomKind>,
+
+    #[serde(default = "default_context_scope_mode")]
+    pub context_scope_mode: ContextScopeMode,
+    #[serde(default)]
+    pub context_scope_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub context_scope_window: Option<ContextScopeWindow>,
+    #[serde(default = "default_captured_kinds")]
+    pub context_include_kinds: Vec<AtomKind>,
+
+    #[serde(default = "default_citation_policy")]
+    pub citation_policy: CitationPolicy,
+
+    #[serde(default)]
+    pub max_source_atoms: Option<i32>,
+    #[serde(default)]
+    pub max_source_tokens: Option<i32>,
+    #[serde(default)]
+    pub max_tool_iterations: Option<i32>,
+
+    pub schedule: String,
+    #[serde(default)]
+    pub schedule_tz: Option<String>,
+
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub output_atom_tags: Vec<String>,
+}
+
+fn default_captured_kinds() -> Vec<AtomKind> {
+    vec![AtomKind::Captured]
+}
+fn default_context_scope_mode() -> ContextScopeMode {
+    ContextScopeMode::All
+}
+fn default_citation_policy() -> CitationPolicy {
+    CitationPolicy::SourceOnly
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CreateReportRequest {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: None,
+            research_prompt: String::new(),
+            source_scope_tag_ids: Vec::new(),
+            source_scope_window: None,
+            source_include_kinds: default_captured_kinds(),
+            context_scope_mode: default_context_scope_mode(),
+            context_scope_tag_ids: Vec::new(),
+            context_scope_window: None,
+            context_include_kinds: default_captured_kinds(),
+            citation_policy: default_citation_policy(),
+            max_source_atoms: None,
+            max_source_tokens: None,
+            max_tool_iterations: None,
+            schedule: String::new(),
+            schedule_tz: None,
+            enabled: default_true(),
+            output_atom_tags: Vec::new(),
+        }
+    }
+}
+
+/// `PUT /api/reports/:id` payload. All fields optional — only present
+/// fields are written. The storage layer composes the merged row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct UpdateReportRequest {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub research_prompt: Option<String>,
+
+    pub source_scope_tag_ids: Option<Vec<String>>,
+    pub source_scope_window: Option<Option<SourceScopeWindow>>,
+    pub source_include_kinds: Option<Vec<AtomKind>>,
+
+    pub context_scope_mode: Option<ContextScopeMode>,
+    pub context_scope_tag_ids: Option<Vec<String>>,
+    pub context_scope_window: Option<Option<ContextScopeWindow>>,
+    pub context_include_kinds: Option<Vec<AtomKind>>,
+
+    pub citation_policy: Option<CitationPolicy>,
+
+    pub max_source_atoms: Option<Option<i32>>,
+    pub max_source_tokens: Option<Option<i32>>,
+    pub max_tool_iterations: Option<Option<i32>>,
+
+    pub schedule: Option<String>,
+    pub schedule_tz: Option<Option<String>>,
+
+    pub enabled: Option<bool>,
+    pub output_atom_tags: Option<Vec<String>>,
+}
+
+/// Provenance row linking a finding atom back to the report definition
+/// that produced it. The link survives report deletion (FK ON DELETE SET
+/// NULL on `report_id`) and run-row GC (no FK on `run_id`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReportFinding {
+    pub finding_atom_id: String,
+    pub report_id: Option<String>,
+    pub run_id: Option<String>,
+    pub report_name_snapshot: String,
+    pub created_at: String,
+}
+
+/// One `[N]` citation marker resolved to a specific atom and excerpt.
+/// `position` is the 1-indexed order in which the marker appears in the
+/// finding's prose; multiple positions may resolve to the same atom.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReportFindingCitation {
+    pub finding_atom_id: String,
+    pub cited_atom_id: String,
+    pub position: i32,
+    pub excerpt: String,
 }

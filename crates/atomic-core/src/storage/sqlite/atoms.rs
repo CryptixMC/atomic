@@ -25,7 +25,7 @@ fn escape_like_pattern(input: &str) -> String {
 
 /// Insert the FTS row for an atom. Call after the corresponding row has been
 /// inserted into `atoms` so the external-content select finds the current state.
-fn atoms_fts_insert(conn: &rusqlite::Connection, atom_id: &str) -> rusqlite::Result<()> {
+pub(super) fn atoms_fts_insert(conn: &rusqlite::Connection, atom_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO atoms_fts(rowid, id, content)
          SELECT rowid, id, content FROM atoms WHERE id = ?1",
@@ -238,6 +238,9 @@ impl SqliteStorage {
             tagging_status: "pending".to_string(),
             embedding_error: None,
             tagging_error: None,
+            // User-facing inserts only ever produce captured atoms. The
+            // column default in V18 matches; this is the explicit form.
+            kind: crate::models::AtomKind::Captured,
         };
 
         let tags = {
@@ -320,6 +323,7 @@ impl SqliteStorage {
                     tagging_status: "pending".to_string(),
                     embedding_error: None,
                     tagging_error: None,
+                    kind: crate::models::AtomKind::Captured,
                 };
 
                 atoms_with_tags.push(AtomWithTags { atom, tags: vec![] });
@@ -619,9 +623,14 @@ impl SqliteStorage {
         Ok(())
     }
 
-    pub(crate) fn get_atoms_by_tag_impl(&self, tag_id: &str) -> StorageResult<Vec<AtomWithTags>> {
+    pub(crate) fn get_atoms_by_tag_impl(
+        &self,
+        tag_id: &str,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithTags>> {
         let conn = self.db.read_conn()?;
 
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("a.kind");
         let mut stmt = conn.prepare(&format!(
             "WITH RECURSIVE descendant_tags(id) AS (
                 SELECT ?1
@@ -633,12 +642,21 @@ impl SqliteStorage {
             FROM atom_tags at
             INNER JOIN atoms a ON a.id = at.atom_id
             WHERE at.tag_id IN (SELECT id FROM descendant_tags)
+              AND {kind_frag}
             GROUP BY a.id
             ORDER BY a.updated_at DESC",
         ))?;
 
+        // tag_id first, then the kind bind values.
+        let mut bind_values: Vec<&dyn rusqlite::ToSql> = vec![&tag_id];
+        for v in &kind_binds {
+            bind_values.push(v as &dyn rusqlite::ToSql);
+        }
         let atoms: Vec<Atom> = stmt
-            .query_map(rusqlite::params![tag_id], atom_from_row)?
+            .query_map(
+                rusqlite::params_from_iter(bind_values.iter()),
+                atom_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         // Batch load tags for the fetched atoms
@@ -656,16 +674,184 @@ impl SqliteStorage {
         Ok(result)
     }
 
+    /// Resolve a report's source-scope atom set in a single recursive CTE.
+    ///
+    /// Three branches by `tag_ids`:
+    /// - empty: skip the CTE entirely (linear scan with optional time + kind
+    ///   filters).
+    /// - non-empty: recursive subtree expansion over multiple roots.
+    ///
+    /// Centralizes the scope query so the reports runner and any future
+    /// scope-preview UI use exactly the same predicate the runner does.
+    pub(crate) fn list_atoms_for_report_scope_sync(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>> {
+        let conn = self.db.read_conn()?;
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("a.kind");
+
+        // Build SQL based on whether we have a tag scope. The shapes differ
+        // enough that splitting is clearer than threading conditional
+        // clauses through one big format!.
+        let sql = if tag_ids.is_empty() {
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            let limit_pred = if limit.is_some() { "LIMIT ?" } else { "" };
+            format!(
+                "SELECT {ATOM_COLUMNS_A}
+                 FROM atoms a
+                 WHERE {kind_frag}
+                   {since_pred}
+                 ORDER BY a.created_at DESC
+                 {limit_pred}"
+            )
+        } else {
+            let tag_placeholders = (0..tag_ids.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            let limit_pred = if limit.is_some() { "LIMIT ?" } else { "" };
+            format!(
+                "WITH RECURSIVE descendant_tags(id) AS (
+                    SELECT id FROM tags WHERE id IN ({tag_placeholders})
+                    UNION ALL
+                    SELECT t.id FROM tags t
+                    INNER JOIN descendant_tags dt ON t.parent_id = dt.id
+                 )
+                 SELECT {ATOM_COLUMNS_A}
+                 FROM atoms a
+                 WHERE EXISTS (
+                     SELECT 1 FROM atom_tags at
+                     WHERE at.atom_id = a.id
+                       AND at.tag_id IN (SELECT id FROM descendant_tags)
+                 )
+                   AND {kind_frag}
+                   {since_pred}
+                 GROUP BY a.id
+                 ORDER BY a.created_at DESC
+                 {limit_pred}"
+            )
+        };
+
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        // tag roots first so they match the placeholders in the CTE.
+        for t in tag_ids {
+            binds.push(t as &dyn rusqlite::ToSql);
+        }
+        for v in &kind_binds {
+            binds.push(v as &dyn rusqlite::ToSql);
+        }
+        if let Some(s) = &since {
+            binds.push(s as &dyn rusqlite::ToSql);
+        }
+        if let Some(l) = &limit {
+            binds.push(l as &dyn rusqlite::ToSql);
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let atoms: Vec<Atom> = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), atom_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let atom_ids: Vec<String> = atoms.iter().map(|a| a.id.clone()).collect();
+        let tag_map = get_atom_tags_map_for_ids(&conn, &atom_ids)?;
+        Ok(atoms
+            .into_iter()
+            .map(|atom| {
+                let tags = tag_map.get(&atom.id).cloned().unwrap_or_default();
+                AtomWithTags { atom, tags }
+            })
+            .collect())
+    }
+
+    pub(crate) fn count_atoms_for_report_scope_sync(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
+        let conn = self.db.read_conn()?;
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("a.kind");
+
+        let sql = if tag_ids.is_empty() {
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            format!("SELECT COUNT(*) FROM atoms a WHERE {kind_frag} {since_pred}")
+        } else {
+            let tag_placeholders = (0..tag_ids.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            format!(
+                "WITH RECURSIVE descendant_tags(id) AS (
+                    SELECT id FROM tags WHERE id IN ({tag_placeholders})
+                    UNION ALL
+                    SELECT t.id FROM tags t
+                    INNER JOIN descendant_tags dt ON t.parent_id = dt.id
+                 )
+                 SELECT COUNT(DISTINCT a.id) FROM atoms a
+                 WHERE EXISTS (
+                     SELECT 1 FROM atom_tags at
+                     WHERE at.atom_id = a.id
+                       AND at.tag_id IN (SELECT id FROM descendant_tags)
+                 )
+                   AND {kind_frag}
+                   {since_pred}"
+            )
+        };
+
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for t in tag_ids {
+            binds.push(t as &dyn rusqlite::ToSql);
+        }
+        for v in &kind_binds {
+            binds.push(v as &dyn rusqlite::ToSql);
+        }
+        if let Some(s) = &since {
+            binds.push(s as &dyn rusqlite::ToSql);
+        }
+
+        let count: i32 = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
+            row.get(0)
+        })?;
+        Ok(count)
+    }
+
     pub(crate) fn list_atoms_impl(
         &self,
         params: &ListAtomsParams,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<PaginatedAtoms> {
         let conn = self.db.read_conn()?;
         let use_cursor = params.cursor.is_some() && params.cursor_id.is_some();
 
-        // Determine if non-tag filters are active (source filters bypass atom_count shortcut)
-        let has_extra_filters =
-            !matches!(params.source_filter, SourceFilter::All) || params.source_value.is_some();
+        // A non-All kind filter forces the slow count path because the
+        // denormalized `tags.atom_count` is kind-blind. Source-value and
+        // source-filter behave the same way; treat kinds as part of that
+        // "extra filter" set.
+        let has_kind_filter = !matches!(kinds, crate::models::KindFilter::All);
+        let has_extra_filters = !matches!(params.source_filter, SourceFilter::All)
+            || params.source_value.is_some()
+            || has_kind_filter;
 
         // --- Build ORDER BY ---
         let sort_col = match params.sort_by {
@@ -735,6 +921,22 @@ impl SqliteStorage {
             param_idx += 2;
         }
 
+        // Kind filter (numbered placeholders to match this function's bind style)
+        if let crate::models::KindFilter::Only(kind_vec) = kinds {
+            if kind_vec.is_empty() {
+                where_clauses.push("1 = 0".to_string());
+            } else {
+                let placeholders: Vec<String> = (0..kind_vec.len())
+                    .map(|i| format!("?{}", param_idx + i))
+                    .collect();
+                where_clauses.push(format!("a.kind IN ({})", placeholders.join(", ")));
+                for k in kind_vec {
+                    bind_values.push(Box::new(k.as_str().to_string()));
+                }
+                param_idx += kind_vec.len();
+            }
+        }
+
         let where_sql = if where_clauses.is_empty() {
             String::new()
         } else {
@@ -797,7 +999,21 @@ impl SqliteStorage {
             if let Some(ref sv) = params.source_value {
                 count_wheres.push(format!("a.source = ?{}", ci));
                 count_binds.push(Box::new(sv.clone()));
-                // ci += 1;
+                ci += 1;
+            }
+            if let crate::models::KindFilter::Only(kind_vec) = kinds {
+                if kind_vec.is_empty() {
+                    count_wheres.push("1 = 0".to_string());
+                } else {
+                    let placeholders: Vec<String> = (0..kind_vec.len())
+                        .map(|i| format!("?{}", ci + i))
+                        .collect();
+                    count_wheres.push(format!("a.kind IN ({})", placeholders.join(", ")));
+                    for k in kind_vec {
+                        count_binds.push(Box::new(k.as_str().to_string()));
+                    }
+                    // ci no longer used after this point in this branch
+                }
             }
             let count_where = if count_wheres.is_empty() {
                 String::new()
@@ -1197,16 +1413,24 @@ impl SqliteStorage {
         Ok(results)
     }
 
-    pub(crate) fn get_atoms_with_embeddings_impl(&self) -> StorageResult<Vec<AtomWithEmbedding>> {
+    pub(crate) fn get_atoms_with_embeddings_impl(
+        &self,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithEmbedding>> {
         let conn = self.db.read_conn()?;
 
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("kind");
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM atoms ORDER BY updated_at DESC",
+            "SELECT {} FROM atoms WHERE {kind_frag} ORDER BY updated_at DESC",
             ATOM_COLUMNS
         ))?;
 
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = kind_binds
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
         let atoms: Vec<Atom> = stmt
-            .query_map([], atom_from_row)?
+            .query_map(rusqlite::params_from_iter(bind_refs.iter()), atom_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         let tag_map = get_all_atom_tags_map(&conn)?;
@@ -1376,19 +1600,26 @@ impl SqliteStorage {
     /// LIMIT-1 nondeterministic pick.
     pub(crate) fn get_canvas_atom_metadata_light_sync(
         &self,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<(String, String, Option<String>, i32, Option<String>)>> {
         let conn = self.db.read_conn()?;
-        let mut stmt = conn.prepare(
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("a.kind");
+        let mut stmt = conn.prepare(&format!(
             "SELECT a.id, a.title, MIN(t.name) AS primary_tag, COUNT(at.tag_id) AS tag_count, a.source_url
              FROM atoms a
              LEFT JOIN atom_tags at ON at.atom_id = a.id
              LEFT JOIN tags t ON t.id = at.tag_id
              WHERE a.embedding_status = 'complete'
+               AND {kind_frag}
              GROUP BY a.id, a.title, a.source_url"
-        )?;
+        ))?;
 
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = kind_binds
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(bind_refs.iter()), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1496,8 +1727,12 @@ impl AtomStore for SqliteStorage {
         self.delete_atom_impl(id)
     }
 
-    async fn get_atoms_by_tag(&self, tag_id: &str) -> StorageResult<Vec<AtomWithTags>> {
-        self.get_atoms_by_tag_impl(tag_id)
+    async fn get_atoms_by_tag(
+        &self,
+        tag_id: &str,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithTags>> {
+        self.get_atoms_by_tag_impl(tag_id, kinds)
     }
 
     async fn get_atom_links(&self, atom_id: &str) -> StorageResult<Vec<AtomLink>> {
@@ -1512,8 +1747,12 @@ impl AtomStore for SqliteStorage {
         self.suggest_atom_links_impl(query, limit)
     }
 
-    async fn list_atoms(&self, params: &ListAtomsParams) -> StorageResult<PaginatedAtoms> {
-        self.list_atoms_impl(params)
+    async fn list_atoms(
+        &self,
+        params: &ListAtomsParams,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<PaginatedAtoms> {
+        self.list_atoms_impl(params, kinds)
     }
 
     async fn get_source_list(&self) -> StorageResult<Vec<SourceInfo>> {
@@ -1536,8 +1775,11 @@ impl AtomStore for SqliteStorage {
         self.save_atom_positions_impl(positions)
     }
 
-    async fn get_atoms_with_embeddings(&self) -> StorageResult<Vec<AtomWithEmbedding>> {
-        self.get_atoms_with_embeddings_impl()
+    async fn get_atoms_with_embeddings(
+        &self,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<Vec<AtomWithEmbedding>> {
+        self.get_atoms_with_embeddings_impl(kinds)
     }
 
     async fn get_atom_tag_ids(&self, atom_id: &str) -> StorageResult<Vec<String>> {
@@ -1591,7 +1833,43 @@ impl AtomStore for SqliteStorage {
 
     async fn get_canvas_atom_metadata_light(
         &self,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<(String, String, Option<String>, i32, Option<String>)>> {
-        self.get_canvas_atom_metadata_light_sync()
+        self.get_canvas_atom_metadata_light_sync(kinds)
+    }
+
+    async fn list_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>> {
+        let storage = self.clone();
+        let tag_ids = tag_ids.to_vec();
+        let since = since.map(|s| s.to_string());
+        let kinds = kinds.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.list_atoms_for_report_scope_sync(&tag_ids, since.as_deref(), &kinds, limit)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn count_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
+        let storage = self.clone();
+        let tag_ids = tag_ids.to_vec();
+        let since = since.map(|s| s.to_string());
+        let kinds = kinds.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.count_atoms_for_report_scope_sync(&tag_ids, since.as_deref(), &kinds)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 }
