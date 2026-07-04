@@ -135,11 +135,17 @@ async fn create_manager(
             );
             atomic_core::DatabaseManager::new_postgres(data_dir, url)
                 .await
-                .expect("Failed to connect to Postgres")
+                .unwrap_or_else(|e| {
+                    tracing::error!("Failed to connect to Postgres: {e}");
+                    std::process::exit(1);
+                })
         }
         _ => {
             tracing::info!(backend = "sqlite", path = %data_dir.display(), "storage backend selected");
-            atomic_core::DatabaseManager::new(data_dir).expect("Failed to open database manager")
+            atomic_core::DatabaseManager::new(data_dir).unwrap_or_else(|e| {
+                tracing::error!("Failed to open database manager: {e}");
+                std::process::exit(1);
+            })
         }
     }
 }
